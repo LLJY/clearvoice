@@ -386,6 +386,29 @@ def _pw_conf_filter_chain(
         f'                            "Post Filter Beta" = {post_filter_beta}\n'
         "                        }\n"
         "                    }\n"
+        "                    # AGC: keeps voice at 80-95% regardless of input level\n"
+        "                    {\n"
+        "                        type   = lv2\n"
+        "                        name   = agc\n"
+        '                        plugin = "http://calf.sourceforge.net/plugins/Compressor"\n'
+        "                        control = {\n"
+        '                            "bypass"      = 0\n'
+        '                            "level_in"    = 1.0\n'
+        '                            "threshold"   = 0.15\n'  # ~-16dB, catches quiet speech
+        '                            "ratio"       = 4.0\n'  # strong compression
+        '                            "attack"      = 10.0\n'  # 10ms, catches syllables
+        '                            "release"     = 150.0\n'  # 150ms, smooth
+        '                            "makeup"      = 2.5\n'  # bring compressed signal up
+        '                            "knee"        = 4.0\n'  # soft knee for natural sound
+        '                            "detection"   = 0\n'  # RMS detection
+        '                            "stereo_link" = 1\n'
+        '                            "mix"         = 1.0\n'  # 100% wet
+        "                        }\n"
+        "                    }\n"
+        "                ]\n"
+        "                links = [\n"
+        '                    { output = "deepfilter:Audio Out" input = "agc:in_l" }\n'
+        '                    { output = "deepfilter:Audio Out" input = "agc:in_r" }\n'
         "                ]\n"
         "            }\n"
         "            capture.props = {\n"
