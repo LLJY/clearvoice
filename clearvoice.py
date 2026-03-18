@@ -68,6 +68,10 @@ LADSPA_SEARCH_PATHS = [
     str(Path.home() / ".ladspa"),
 ]
 
+# Speaker enhancement config (ships with the project)
+SPEAKER_CHAIN_CONF = Path(__file__).parent / "speaker-chain.conf"
+SPEAKER_SINK_NAME = "clearvoice_speakers"
+
 # Icons
 ICON_ACTIVE = "audio-input-microphone"
 ICON_INACTIVE = "microphone-sensitivity-muted-symbolic"
@@ -118,7 +122,11 @@ DEFAULT_CONFIG = {
     "echo_cancellation": {
         "enabled": False,
     },
+    "speaker_enhancement": {
+        "enabled": True,
+    },
     "previous_default_source": None,
+    "previous_default_sink": None,
 }
 
 
@@ -224,6 +232,49 @@ def pw_get_default_source() -> str:
         return r.stdout.strip()
     except Exception:
         return ""
+
+
+def pw_get_default_sink() -> str:
+    try:
+        r = subprocess.run(
+            ["pactl", "get-default-sink"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def pw_set_default_sink(node_id: int) -> bool:
+    """Set default sink by PipeWire node ID via wpctl."""
+    try:
+        r = subprocess.run(
+            ["wpctl", "set-default", str(node_id)],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def pw_find_node_id(node_name: str) -> int | None:
+    """Find a PipeWire node ID by node.name."""
+    try:
+        r = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return None
+        for obj in json.loads(r.stdout):
+            props = obj.get("info", {}).get("props", {})
+            if props.get("node.name") == node_name:
+                if props.get("media.class") in ("Audio/Sink", "Audio/Source"):
+                    return obj["id"]
+        return None
+    except Exception:
+        return None
 
 
 def pw_set_default_source(name: str) -> bool:
@@ -411,17 +462,17 @@ def _pw_conf_echo_cancel(
 class PipelineManager:
     """Manages the ClearVoice audio processing pipeline.
 
-    Depending on config, spawns up to two PipeWire client processes:
-      1. echo-cancel  (beamforming / AEC)   → optional intermediate source
-      2. filter-chain  (DeepFilterNet)       → final virtual mic
-
-    The last stage in the chain is set as the system default source.
+    Spawns up to three PipeWire client processes:
+      1. echo-cancel   (beamforming / AEC)   → optional intermediate source
+      2. filter-chain   (DeepFilterNet)       → virtual mic
+      3. speaker-chain  (EQ / bass / stereo)  → virtual sink for speakers
     """
 
     def __init__(self, config: dict):
         self.config = config
         self._fc_proc: subprocess.Popen | None = None
         self._ec_proc: subprocess.Popen | None = None
+        self._spk_proc: subprocess.Popen | None = None
         self._running = False
         self._lock = threading.Lock()
 
@@ -448,8 +499,12 @@ class PipelineManager:
         return self.bf_enabled or self.aec_enabled
 
     @property
+    def spk_enabled(self) -> bool:
+        return self.config.get("speaker_enhancement", {}).get("enabled", False)
+
+    @property
     def any_processing(self) -> bool:
-        return self.nc_enabled or self.ec_needed
+        return self.nc_enabled or self.ec_needed or self.spk_enabled
 
     # ── Source Resolution ──
 
@@ -490,21 +545,31 @@ class PipelineManager:
         if not self.any_processing:
             return False, "Enable at least one processing feature"
 
-        plugin_path = find_ladspa_plugin(DEEPFILTER_SO)
-        if self.nc_enabled and not plugin_path:
-            return False, f"LADSPA plugin not found: {DEEPFILTER_SO}"
+        needs_mic = self.nc_enabled or self.ec_needed
+        source = None
 
-        source = self._resolve_source()
-        if not source:
-            return False, "No audio source device found"
+        if needs_mic:
+            plugin_path = find_ladspa_plugin(DEEPFILTER_SO)
+            if self.nc_enabled and not plugin_path:
+                return False, f"LADSPA plugin not found: {DEEPFILTER_SO}"
 
-        log.info("Starting pipeline — source=%s", source)
+            source = self._resolve_source()
+            if not source:
+                return False, "No audio source device found"
 
-        # Remember current default so we can restore it
-        current_default = pw_get_default_source()
-        if current_default and not current_default.startswith("clearvoice"):
-            self.config["previous_default_source"] = current_default
-            save_config(self.config)
+        log.info(
+            "Starting pipeline — source=%s mic=%s spk=%s",
+            source,
+            needs_mic,
+            self.spk_enabled,
+        )
+
+        # Remember current defaults so we can restore them
+        if needs_mic:
+            current_default = pw_get_default_source()
+            if current_default and not current_default.startswith("clearvoice"):
+                self.config["previous_default_source"] = current_default
+                save_config(self.config)
 
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -591,10 +656,33 @@ class PipelineManager:
                 log.info("Filter-chain ready: %s", VIRTUAL_MIC_NAME)
                 final_node = VIRTUAL_MIC_NAME
 
-            # ── Stage 3: Set as default ──
-            time.sleep(0.3)
-            if not pw_set_default_source(final_node):
-                log.warning("Could not set default source to %s", final_node)
+            # ── Stage 3: Set mic as default ──
+            if needs_mic:
+                time.sleep(0.3)
+                if not pw_set_default_source(final_node):
+                    log.warning("Could not set default source to %s", final_node)
+
+            # ── Stage 4: Speaker enhancement ──
+            if self.spk_enabled and SPEAKER_CHAIN_CONF.is_file():
+                current_sink = pw_get_default_sink()
+                if current_sink and not current_sink.startswith("clearvoice"):
+                    self.config["previous_default_sink"] = current_sink
+                    save_config(self.config)
+
+                log.info("Spawning speaker-chain process")
+                self._spk_proc = subprocess.Popen(
+                    ["pipewire", "-c", str(SPEAKER_CHAIN_CONF)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+
+                if pw_wait_for_node(SPEAKER_SINK_NAME, timeout=6.0):
+                    sink_id = pw_find_node_id(SPEAKER_SINK_NAME)
+                    if sink_id:
+                        pw_set_default_sink(sink_id)
+                    log.info("Speaker chain ready: %s", SPEAKER_SINK_NAME)
+                else:
+                    log.warning("Speaker chain failed to start (non-fatal)")
 
             self._running = True
             return True, "Pipeline active"
@@ -618,6 +706,13 @@ class PipelineManager:
         if prev:
             pw_set_default_source(prev)
 
+        prev_sink = self.config.get("previous_default_sink")
+        if prev_sink:
+            # Restore by name — find its node ID
+            sink_id = pw_find_node_id(prev_sink)
+            if sink_id:
+                pw_set_default_sink(sink_id)
+
         self._kill_all()
         self._running = False
         return True, "Pipeline stopped"
@@ -639,6 +734,9 @@ class PipelineManager:
         if self._ec_proc and self._ec_proc.poll() is not None:
             log.error("echo-cancel died (rc=%d)", self._ec_proc.returncode)
             return False
+        if self._spk_proc and self._spk_proc.poll() is not None:
+            log.error("speaker-chain died (rc=%d)", self._spk_proc.returncode)
+            return False
         return True
 
     # ── Internals ──
@@ -653,7 +751,7 @@ class PipelineManager:
         return "(no output)"
 
     def _kill_all(self):
-        for attr in ("_fc_proc", "_ec_proc"):
+        for attr in ("_fc_proc", "_ec_proc", "_spk_proc"):
             proc: subprocess.Popen | None = getattr(self, attr)
             if proc is None:
                 continue
@@ -800,6 +898,16 @@ class ClearVoiceTray:
         self._mi_aec.set_active(self.config["echo_cancellation"]["enabled"])
         self._mi_aec.connect("toggled", self._on_aec)
         m.append(self._mi_aec)
+
+        m.append(Gtk.SeparatorMenuItem())
+
+        # ── Speaker Enhancement ──
+        self._mi_spk = Gtk.CheckMenuItem(label="Speaker Enhancement")
+        self._mi_spk.set_active(
+            self.config.get("speaker_enhancement", {}).get("enabled", False)
+        )
+        self._mi_spk.connect("toggled", self._on_spk)
+        m.append(self._mi_spk)
 
         m.append(Gtk.SeparatorMenuItem())
 
@@ -1016,6 +1124,14 @@ class ClearVoiceTray:
         if self.pipeline.running:
             self._async_restart()
 
+    def _on_spk(self, item):
+        if "speaker_enhancement" not in self.config:
+            self.config["speaker_enhancement"] = {}
+        self.config["speaker_enhancement"]["enabled"] = item.get_active()
+        save_config(self.config)
+        if self.pipeline.running:
+            self._async_restart()
+
     def _on_quit(self, _item):
         self.pipeline.stop()
         save_config(self.config)
@@ -1057,6 +1173,8 @@ class ClearVoiceTray:
                 parts.append("BF")
             if self.pipeline.aec_enabled:
                 parts.append("AEC")
+            if self.pipeline.spk_enabled:
+                parts.append("SPK")
             tag = "+".join(parts) or "active"
             src = self.config.get("source_device") or "auto"
             self._mi_status.set_label(f"Status: Active [{tag}] src={src}")
