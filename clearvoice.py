@@ -73,8 +73,8 @@ SPEAKER_CHAIN_CONF = Path(__file__).parent / "speaker-chain.conf"
 SPEAKER_SINK_NAME = "clearvoice_speakers"
 
 # Icons (3 states)
-ICON_ACTIVE = "audio-input-microphone"  # black — processing audio
-ICON_STANDBY = "audio-input-microphone-symbolic"  # grey — enabled, idle
+ICON_ACTIVE = "audio-input-microphone-high"  # full bars — processing audio
+ICON_STANDBY = "audio-input-microphone-low"  # low bar — enabled, idle
 ICON_OFF = "microphone-sensitivity-muted-symbolic"  # slashed — disabled
 
 log = logging.getLogger(APP_ID)
@@ -1206,7 +1206,7 @@ class ClearVoiceTray:
         elif self.status_icon:
             self.status_icon.set_from_icon_name(icon)
 
-    def _update_status(self):
+    def _update_status(self, nodes_active: bool = False):
         if self.pipeline.running:
             parts = []
             if self.pipeline.nc_enabled:
@@ -1217,11 +1217,11 @@ class ClearVoiceTray:
                 parts.append("AEC")
             if self.pipeline.spk_enabled:
                 parts.append("SPK")
-            tag = "+".join(parts) or "active"
-            src = self.config.get("source_device") or "auto"
-            self._mi_status.set_label(f"Status: Active [{tag}] src={src}")
+            tag = "+".join(parts) or "enabled"
+            state = "Processing" if nodes_active else "Standby"
+            self._mi_status.set_label(f"{state} [{tag}]")
         else:
-            self._mi_status.set_label("Status: Off")
+            self._mi_status.set_label("Off")
 
     def _on_health_tick(self):
         if self.pipeline.running:
@@ -1229,9 +1229,10 @@ class ClearVoiceTray:
                 log.warning("Health check failed — restarting pipeline")
                 self._async_restart()
                 return True
-            # Poll node state for icon update (lightweight)
+            # Poll node state for icon + status update (lightweight)
             active = pw_nodes_active()
             self._update_icon(nodes_active=active)
+            self._update_status(nodes_active=active)
         return True  # keep timer
 
     @staticmethod
