@@ -278,12 +278,41 @@ def pw_find_node_id(node_name: str) -> int | None:
         return None
 
 
-def pw_nodes_active(prefix: str = "clearvoice") -> bool:
-    """Check if any clearvoice PipeWire nodes are in 'running' state."""
+def pw_node_running(node_id: int) -> bool:
+    """Check if a single PipeWire node is in 'running' state."""
+    try:
+        r = subprocess.run(
+            ["pw-cli", "info", str(node_id)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return 'state: "running"' in r.stdout
+    except Exception:
+        return False
+
+
+def pw_nodes_active(node_ids: list[int] | None = None) -> bool:
+    """Check if any of the given PipeWire nodes are running.
+
+    If node_ids is None, falls back to scanning pw-dump (slower).
+    """
+    if node_ids:
+        return any(pw_node_running(nid) for nid in node_ids)
+    # Fallback: full scan
     try:
         r = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
             return False
+        for obj in json.loads(r.stdout):
+            props = obj.get("info", {}).get("props", {})
+            name = props.get("node.name", "")
+            state = obj.get("info", {}).get("state", "")
+            if name.startswith("clearvoice") and state == "running":
+                return True
+        return False
+    except Exception:
+        return False
         for obj in json.loads(r.stdout):
             props = obj.get("info", {}).get("props", {})
             name = props.get("node.name", "")
@@ -515,6 +544,7 @@ class PipelineManager:
         self._ec_proc: subprocess.Popen | None = None
         self._spk_proc: subprocess.Popen | None = None
         self._running = False
+        self._node_ids: list[int] = []
         self._lock = threading.Lock()
 
     # ── Properties ──
@@ -725,6 +755,13 @@ class PipelineManager:
                 else:
                     log.warning("Speaker chain failed to start (non-fatal)")
 
+            # Collect our node IDs for lightweight state polling
+            self._node_ids = []
+            for name in (VIRTUAL_MIC_NAME, SPEAKER_SINK_NAME):
+                nid = pw_find_node_id(name)
+                if nid:
+                    self._node_ids.append(nid)
+
             self._running = True
             return True, "Pipeline active"
 
@@ -765,6 +802,7 @@ class PipelineManager:
 
         self._kill_all()
         self._running = False
+        self._node_ids = []
         return True, "Pipeline stopped"
 
     def restart(self) -> tuple[bool, str]:
@@ -849,8 +887,8 @@ class ClearVoiceTray:
         self._update_icon()
         self._update_status()
 
-        # Health-check timer (every 3 s)
-        GLib.timeout_add_seconds(3, self._on_health_tick)
+        # Health-check timer (every 10 s)
+        GLib.timeout_add_seconds(10, self._on_health_tick)
 
         # Start pipeline if enabled in config (off GTK thread)
         if self.config.get("enabled", True):
@@ -1252,8 +1290,8 @@ class ClearVoiceTray:
                 log.warning("Health check failed — restarting pipeline")
                 self._async_restart()
                 return True
-            # Poll node state for icon + status update (lightweight)
-            active = pw_nodes_active()
+            # Poll node state for icon + status (lightweight per-node query)
+            active = pw_nodes_active(self.pipeline._node_ids)
             self._update_icon(nodes_active=active)
             self._update_status(nodes_active=active)
         return True  # keep timer
