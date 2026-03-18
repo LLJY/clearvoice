@@ -72,9 +72,10 @@ LADSPA_SEARCH_PATHS = [
 SPEAKER_CHAIN_CONF = Path(__file__).parent / "speaker-chain.conf"
 SPEAKER_SINK_NAME = "clearvoice_speakers"
 
-# Icons
-ICON_ACTIVE = "audio-input-microphone"
-ICON_INACTIVE = "microphone-sensitivity-muted-symbolic"
+# Icons (3 states)
+ICON_ACTIVE = "audio-input-microphone"  # black — processing audio
+ICON_STANDBY = "audio-input-microphone-symbolic"  # grey — enabled, idle
+ICON_OFF = "microphone-sensitivity-muted-symbolic"  # slashed — disabled
 
 log = logging.getLogger(APP_ID)
 
@@ -275,6 +276,23 @@ def pw_find_node_id(node_name: str) -> int | None:
         return None
     except Exception:
         return None
+
+
+def pw_nodes_active(prefix: str = "clearvoice") -> bool:
+    """Check if any clearvoice PipeWire nodes are in 'running' state."""
+    try:
+        r = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return False
+        for obj in json.loads(r.stdout):
+            props = obj.get("info", {}).get("props", {})
+            name = props.get("node.name", "")
+            state = obj.get("info", {}).get("state", "")
+            if name.startswith(prefix) and state == "running":
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def pw_set_default_source(name: str) -> bool:
@@ -1157,8 +1175,13 @@ class ClearVoiceTray:
 
         threading.Thread(target=_do, daemon=True).start()
 
-    def _update_icon(self):
-        icon = ICON_ACTIVE if self.pipeline.running else ICON_INACTIVE
+    def _update_icon(self, nodes_active: bool = False):
+        if not self.pipeline.running:
+            icon = ICON_OFF
+        elif nodes_active:
+            icon = ICON_ACTIVE
+        else:
+            icon = ICON_STANDBY
         if self.indicator:
             self.indicator.set_icon_full(icon, APP_NAME)
         elif self.status_icon:
@@ -1182,9 +1205,14 @@ class ClearVoiceTray:
             self._mi_status.set_label("Status: Off")
 
     def _on_health_tick(self):
-        if self.pipeline.running and not self.pipeline.check_health():
-            log.warning("Health check failed — restarting pipeline")
-            self._async_restart()
+        if self.pipeline.running:
+            if not self.pipeline.check_health():
+                log.warning("Health check failed — restarting pipeline")
+                self._async_restart()
+                return True
+            # Poll node state for icon update (lightweight)
+            active = pw_nodes_active()
+            self._update_icon(nodes_active=active)
         return True  # keep timer
 
     @staticmethod
