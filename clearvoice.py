@@ -181,7 +181,7 @@ def find_ladspa_plugin(filename: str) -> str | None:
 def check_dependencies() -> list[str]:
     """Return list of missing dependencies."""
     missing = []
-    for cmd in ("pipewire", "pw-dump", "pactl"):
+    for cmd in ("pipewire", "pw-dump", "pactl", "wpctl"):
         if not shutil.which(cmd):
             missing.append(cmd)
     if not find_ladspa_plugin(DEEPFILTER_SO):
@@ -707,6 +707,15 @@ class PipelineManager:
 
         except Exception as exc:
             log.exception("Pipeline start failed")
+            # Restore defaults before killing processes
+            prev_src = self.config.get("previous_default_source")
+            if prev_src:
+                pw_set_default_source(prev_src)
+            prev_sink = self.config.get("previous_default_sink")
+            if prev_sink:
+                sink_id = pw_find_node_id(prev_sink)
+                if sink_id:
+                    pw_set_default_sink(sink_id)
             self._kill_all()
             return False, str(exc)
 
@@ -799,7 +808,7 @@ class ClearVoiceTray:
         if HAS_APPINDICATOR:
             self.indicator = AppIndicator.Indicator.new(
                 APP_ID,
-                ICON_INACTIVE,
+                ICON_OFF,
                 AppIndicator.IndicatorCategory.APPLICATION_STATUS,
             )
             self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
@@ -808,7 +817,7 @@ class ClearVoiceTray:
         else:
             self.indicator = None
             self.status_icon = Gtk.StatusIcon()
-            self.status_icon.set_from_icon_name(ICON_INACTIVE)
+            self.status_icon.set_from_icon_name(ICON_OFF)
             self.status_icon.set_title(APP_NAME)
             self.status_icon.set_visible(True)
             self.status_icon.connect("popup-menu", self._on_popup)
@@ -820,13 +829,17 @@ class ClearVoiceTray:
         # Health-check timer (every 3 s)
         GLib.timeout_add_seconds(3, self._on_health_tick)
 
-        # Start pipeline if enabled in config
+        # Start pipeline if enabled in config (off GTK thread)
         if self.config.get("enabled", True):
-            ok, msg = self.pipeline.start()
-            if not ok:
-                log.error("Failed to start pipeline on launch: %s", msg)
-            self._update_icon()
-            self._update_status()
+
+            def _deferred_start():
+                ok, msg = self.pipeline.start()
+                if not ok:
+                    log.error("Failed to start pipeline on launch: %s", msg)
+                GLib.idle_add(self._update_icon)
+                GLib.idle_add(self._update_status)
+
+            threading.Thread(target=_deferred_start, daemon=True).start()
 
     # ── Menu Construction ──
 
@@ -952,14 +965,20 @@ class ClearVoiceTray:
         self.config["enabled"] = enabled
         save_config(self.config)
         if enabled:
-            ok, msg = self.pipeline.start()
-            if not ok:
-                GLib.idle_add(item.set_active, False)
-                GLib.idle_add(self._show_error, msg)
+
+            def _do():
+                ok, msg = self.pipeline.start()
+                GLib.idle_add(self._update_icon)
+                GLib.idle_add(self._update_status)
+                if not ok:
+                    GLib.idle_add(item.set_active, False)
+                    GLib.idle_add(self._show_error, msg)
+
+            threading.Thread(target=_do, daemon=True).start()
         else:
             self.pipeline.stop()
-        self._update_icon()
-        self._update_status()
+            self._update_icon()
+            self._update_status()
 
     def _on_source_menu_show(self, submenu):
         for child in submenu.get_children():
