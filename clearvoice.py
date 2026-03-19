@@ -83,6 +83,10 @@ log = logging.getLogger(APP_ID)
 # ── Mic Geometry Presets ──────────────────────────────────────────────────────
 
 MIC_PRESETS = {
+    "laptop-dual-50mm": {
+        "label": "Dual 50mm (Aftershock)",
+        "geometry": "-0.025,0,0,0.025,0,0",
+    },
     "laptop-dual-60mm": {
         "label": "Dual 60mm (ThinkPad/Dell)",
         "geometry": "-0.03,0,0,0.03,0,0",
@@ -117,7 +121,7 @@ DEFAULT_CONFIG = {
     },
     "beamforming": {
         "enabled": False,
-        "preset": "laptop-dual-60mm",
+        "preset": "laptop-dual-50mm",
         "custom_geometry": None,
     },
     "echo_cancellation": {
@@ -278,50 +282,99 @@ def pw_find_node_id(node_name: str) -> int | None:
         return None
 
 
-def pw_node_running(node_id: int) -> bool:
-    """Check if a single PipeWire node is in 'running' state."""
-    try:
-        r = subprocess.run(
-            ["pw-cli", "info", str(node_id)],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        return 'state: "running"' in r.stdout
-    except Exception:
-        return False
+class PipeWireMonitor:
+    """Event-driven PipeWire state monitor via ``pw-dump --monitor``.
 
-
-def pw_nodes_active(node_ids: list[int] | None = None) -> bool:
-    """Check if any of the given PipeWire nodes are running.
-
-    If node_ids is None, falls back to scanning pw-dump (slower).
+    Watches for node state changes and fires a callback when any
+    clearvoice node transitions to/from 'running'. Zero CPU when idle.
     """
-    if node_ids:
-        return any(pw_node_running(nid) for nid in node_ids)
-    # Fallback: full scan
-    try:
-        r = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5)
-        if r.returncode != 0:
-            return False
-        for obj in json.loads(r.stdout):
+
+    def __init__(self, on_state_change: callable):
+        self.on_state_change = on_state_change
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._active = False  # current "any node running" state
+        self._enabled = False
+
+    @property
+    def nodes_active(self) -> bool:
+        return self._active
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._enabled = True
+        self._proc = subprocess.Popen(
+            ["pw-dump", "--monitor", "--no-colors"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        log.info("PipeWire monitor started")
+
+    def stop(self):
+        self._enabled = False
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        self._proc = None
+
+    def _read_loop(self):
+        """Parse streaming JSON from pw-dump --monitor."""
+        try:
+            buf = ""
+            depth = 0
+            initial_done = False
+            for line in self._proc.stdout:
+                if not self._enabled:
+                    break
+                buf += line
+                depth += (
+                    line.count("[")
+                    + line.count("{")
+                    - line.count("]")
+                    - line.count("}")
+                )
+                if depth == 0 and buf.strip():
+                    self._handle_json(buf, is_initial=not initial_done)
+                    initial_done = True
+                    buf = ""
+        except Exception:
+            pass
+
+    def _handle_json(self, text: str, is_initial: bool = False):
+        """Check if any clearvoice node is running."""
+        try:
+            objects = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(objects, list):
+            return
+
+        # Only care about our nodes
+        now_active = False
+        found_ours = False
+        for obj in objects:
             props = obj.get("info", {}).get("props", {})
             name = props.get("node.name", "")
+            if not name.startswith("clearvoice"):
+                continue
+            found_ours = True
             state = obj.get("info", {}).get("state", "")
-            if name.startswith("clearvoice") and state == "running":
-                return True
-        return False
-    except Exception:
-        return False
-        for obj in json.loads(r.stdout):
-            props = obj.get("info", {}).get("props", {})
-            name = props.get("node.name", "")
-            state = obj.get("info", {}).get("state", "")
-            if name.startswith(prefix) and state == "running":
-                return True
-        return False
-    except Exception:
-        return False
+            if state == "running":
+                now_active = True
+                break
+
+        # On initial dump, always update. On diffs, only if our nodes changed.
+        if is_initial or found_ours:
+            if now_active != self._active:
+                self._active = now_active
+                GLib.idle_add(self.on_state_change, now_active)
 
 
 def pw_set_default_source(name: str) -> bool:
@@ -544,7 +597,6 @@ class PipelineManager:
         self._ec_proc: subprocess.Popen | None = None
         self._spk_proc: subprocess.Popen | None = None
         self._running = False
-        self._node_ids: list[int] = []
         self._lock = threading.Lock()
 
     # ── Properties ──
@@ -755,13 +807,6 @@ class PipelineManager:
                 else:
                     log.warning("Speaker chain failed to start (non-fatal)")
 
-            # Collect our node IDs for lightweight state polling
-            self._node_ids = []
-            for name in (VIRTUAL_MIC_NAME, SPEAKER_SINK_NAME):
-                nid = pw_find_node_id(name)
-                if nid:
-                    self._node_ids.append(nid)
-
             self._running = True
             return True, "Pipeline active"
 
@@ -802,7 +847,6 @@ class PipelineManager:
 
         self._kill_all()
         self._running = False
-        self._node_ids = []
         return True, "Pipeline stopped"
 
     def restart(self) -> tuple[bool, str]:
@@ -865,6 +909,7 @@ class ClearVoiceTray:
     def __init__(self, pipeline: PipelineManager, config: dict):
         self.pipeline = pipeline
         self.config = config
+        self._pw_monitor: PipeWireMonitor | None = None
 
         if HAS_APPINDICATOR:
             self.indicator = AppIndicator.Indicator.new(
@@ -887,8 +932,12 @@ class ClearVoiceTray:
         self._update_icon()
         self._update_status()
 
-        # Health-check timer (every 10 s)
+        # Health-check timer (process liveness only, 10s)
         GLib.timeout_add_seconds(10, self._on_health_tick)
+
+        # Event-driven state monitor (icon/status updates)
+        self._pw_monitor = PipeWireMonitor(on_state_change=self._on_pw_state_change)
+        self._pw_monitor.start()
 
         # Start pipeline if enabled in config (off GTK thread)
         if self.config.get("enabled", True):
@@ -1231,6 +1280,8 @@ class ClearVoiceTray:
             self._async_restart()
 
     def _on_quit(self, _item):
+        if self._pw_monitor:
+            self._pw_monitor.stop()
         self.pipeline.stop()
         save_config(self.config)
         Gtk.main_quit()
@@ -1284,16 +1335,17 @@ class ClearVoiceTray:
         else:
             self._mi_status.set_label("Off")
 
+    def _on_pw_state_change(self, nodes_active: bool):
+        """Called by PipeWireMonitor when node state changes (GTK thread)."""
+        self._update_icon(nodes_active=nodes_active)
+        self._update_status(nodes_active=nodes_active)
+
     def _on_health_tick(self):
+        """Periodic process liveness check only (no state polling)."""
         if self.pipeline.running:
             if not self.pipeline.check_health():
                 log.warning("Health check failed — restarting pipeline")
                 self._async_restart()
-                return True
-            # Poll node state for icon + status (lightweight per-node query)
-            active = pw_nodes_active(self.pipeline._node_ids)
-            self._update_icon(nodes_active=active)
-            self._update_status(nodes_active=active)
         return True  # keep timer
 
     @staticmethod
@@ -1354,6 +1406,8 @@ def main():
 
     # Clean shutdown on signals
     def _shutdown(*_args):
+        if tray._pw_monitor:
+            tray._pw_monitor.stop()
         pipeline.stop()
         save_config(config)
         Gtk.main_quit()
