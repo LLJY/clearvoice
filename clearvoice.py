@@ -283,17 +283,17 @@ def pw_find_node_id(node_name: str) -> int | None:
 
 
 class PipeWireMonitor:
-    """Event-driven PipeWire state monitor via ``pw-dump --monitor``.
+    """Event-driven PipeWire node state monitor via ``pw-dump --monitor``.
 
-    Watches for node state changes and fires a callback when any
-    clearvoice node transitions to/from 'running'. Zero CPU when idle.
+    Fires *on_state_change(bool)* when any clearvoice node transitions
+    to/from 'running'. Zero CPU when nothing changes.
     """
 
     def __init__(self, on_state_change: callable):
         self.on_state_change = on_state_change
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
-        self._active = False  # current "any node running" state
+        self._active = False
         self._enabled = False
 
     @property
@@ -308,7 +308,7 @@ class PipeWireMonitor:
             ["pw-dump", "--monitor", "--no-colors"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            bufsize=0,  # unbuffered
         )
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
@@ -325,56 +325,61 @@ class PipeWireMonitor:
         self._proc = None
 
     def _read_loop(self):
-        """Parse streaming JSON from pw-dump --monitor."""
+        """Read pw-dump --monitor output, parse JSON chunks by bracket depth."""
         try:
-            buf = ""
+            buf = b""
             depth = 0
             initial_done = False
-            for line in self._proc.stdout:
-                if not self._enabled:
-                    break
+            while self._enabled:
+                line = self._proc.stdout.readline()
+                if not line:
+                    break  # EOF
                 buf += line
-                depth += (
-                    line.count("[")
-                    + line.count("{")
-                    - line.count("]")
-                    - line.count("}")
-                )
+                depth += line.count(b"[") + line.count(b"{")
+                depth -= line.count(b"]") + line.count(b"}")
                 if depth == 0 and buf.strip():
-                    self._handle_json(buf, is_initial=not initial_done)
-                    initial_done = True
-                    buf = ""
-        except Exception:
-            pass
+                    if initial_done:
+                        # Only parse diff events, skip initial dump
+                        self._check_diff(buf)
+                    else:
+                        # Initial dump done — check starting state
+                        self._check_diff(buf)
+                        initial_done = True
+                    buf = b""
+        except Exception as exc:
+            log.debug("PipeWire monitor read error: %s", exc)
 
-    def _handle_json(self, text: str, is_initial: bool = False):
-        """Check if any clearvoice node is running."""
+    def _check_diff(self, raw: bytes):
+        """Scan a JSON chunk for clearvoice node state changes."""
         try:
-            objects = json.loads(text)
-        except json.JSONDecodeError:
+            objects = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
             return
         if not isinstance(objects, list):
             return
 
-        # Only care about our nodes
         now_active = False
         found_ours = False
         for obj in objects:
-            props = obj.get("info", {}).get("props", {})
+            if not isinstance(obj, dict):
+                continue
+            info = obj.get("info")
+            if not isinstance(info, dict):
+                continue
+            props = info.get("props")
+            if not isinstance(props, dict):
+                continue
             name = props.get("node.name", "")
             if not name.startswith("clearvoice"):
                 continue
             found_ours = True
-            state = obj.get("info", {}).get("state", "")
-            if state == "running":
+            if info.get("state") == "running":
                 now_active = True
                 break
 
-        # On initial dump, always update. On diffs, only if our nodes changed.
-        if is_initial or found_ours:
-            if now_active != self._active:
-                self._active = now_active
-                GLib.idle_add(self.on_state_change, now_active)
+        if found_ours and now_active != self._active:
+            self._active = now_active
+            GLib.idle_add(self.on_state_change, now_active)
 
 
 def pw_set_default_source(name: str) -> bool:
@@ -932,10 +937,10 @@ class ClearVoiceTray:
         self._update_icon()
         self._update_status()
 
-        # Health-check timer (process liveness only, 10s)
+        # Process health check (10s)
         GLib.timeout_add_seconds(10, self._on_health_tick)
 
-        # Event-driven state monitor (icon/status updates)
+        # Event-driven node state monitor
         self._pw_monitor = PipeWireMonitor(on_state_change=self._on_pw_state_change)
         self._pw_monitor.start()
 
@@ -1341,7 +1346,7 @@ class ClearVoiceTray:
         self._update_status(nodes_active=nodes_active)
 
     def _on_health_tick(self):
-        """Periodic process liveness check only (no state polling)."""
+        """Process liveness check only — state is event-driven."""
         if self.pipeline.running:
             if not self.pipeline.check_health():
                 log.warning("Health check failed — restarting pipeline")
