@@ -5,6 +5,7 @@ Creates a virtual microphone with DeepFilterNet noise cancellation,
 WebRTC-based beamforming, and acoustic echo cancellation via PipeWire.
 """
 
+import atexit
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ LOG_FILE = CONFIG_DIR / "clearvoice.log"
 RUNTIME_DIR = (
     Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/run-{os.getuid()}")) / APP_ID
 )
+PIDFILE = RUNTIME_DIR / "clearvoice.pid"
 
 # PipeWire node names
 VIRTUAL_MIC_NAME = "clearvoice_source"
@@ -509,6 +511,7 @@ def _pw_conf_filter_chain(
         f'                node.description = "{VIRTUAL_MIC_DESC}"\n'
         "                media.class      = Audio/Source\n"
         "                audio.rate       = 48000\n"
+        "                state.restore-props = false\n"
         "            }\n"
         "        }\n"
         "    }\n"
@@ -602,7 +605,11 @@ class PipelineManager:
         self._ec_proc: subprocess.Popen | None = None
         self._spk_proc: subprocess.Popen | None = None
         self._running = False
+        self._transitioning = False  # True during stop/start — suppresses health checks
         self._lock = threading.Lock()
+
+        # Ensure child processes are cleaned up if we crash
+        atexit.register(self._kill_all)
 
     # ── Properties ──
 
@@ -666,12 +673,41 @@ class PipelineManager:
         with self._lock:
             return self._start_locked()
 
+    @staticmethod
+    def _cleanup_orphans():
+        """Kill any orphaned ClearVoice PipeWire processes from a previous crash."""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "pipewire -c.*/clearvoice/"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            pids = result.stdout.strip().split()
+            if pids:
+                log.warning(
+                    "Cleaning up %d orphaned PipeWire processes: %s", len(pids), pids
+                )
+                for pid in pids:
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except (ProcessLookupError, ValueError):
+                        pass
+                time.sleep(0.5)
+        except Exception:
+            pass
+
     def _start_locked(self) -> tuple[bool, str]:
         if self._running:
             return True, "Already running"
 
         if not self.any_processing:
             return False, "Enable at least one processing feature"
+
+        # Clean up orphans only on first start (not restarts)
+        if not hasattr(self, "_started_once"):
+            self._cleanup_orphans()
+            self._started_once = True
 
         needs_mic = self.nc_enabled or self.ec_needed
         source = None
@@ -738,14 +774,16 @@ class PipelineManager:
                 conf_path.write_text(conf)
 
                 log.info("Spawning echo-cancel process")
+                ec_log = open(RUNTIME_DIR / "echo-cancel.log", "w")
                 self._ec_proc = subprocess.Popen(
                     ["pipewire", "-c", str(conf_path)],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
+                    stderr=ec_log,
                 )
 
                 if not pw_wait_for_node(ec_out_name, timeout=6.0):
-                    stderr = self._read_stderr(self._ec_proc)
+                    ec_log.flush()
+                    stderr = (RUNTIME_DIR / "echo-cancel.log").read_text()[-500:]
                     self._kill_all()
                     return False, f"Echo-cancel failed to start: {stderr}"
 
@@ -770,25 +808,33 @@ class PipelineManager:
                 conf_path.write_text(conf)
 
                 log.info("Spawning filter-chain process")
+                fc_log = open(RUNTIME_DIR / "filter-chain.log", "w")
                 self._fc_proc = subprocess.Popen(
                     ["pipewire", "-c", str(conf_path)],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
+                    stderr=fc_log,
                 )
 
                 if not pw_wait_for_node(VIRTUAL_MIC_NAME, timeout=6.0):
-                    stderr = self._read_stderr(self._fc_proc)
+                    fc_log.flush()
+                    stderr = (RUNTIME_DIR / "filter-chain.log").read_text()[-500:]
                     self._kill_all()
                     return False, f"Filter-chain failed to start: {stderr}"
 
                 log.info("Filter-chain ready: %s", VIRTUAL_MIC_NAME)
                 final_node = VIRTUAL_MIC_NAME
 
-            # ── Stage 3: Set mic as default ──
+            # ── Stage 3: Set mic as default + force volume ──
             if needs_mic:
                 time.sleep(0.3)
                 if not pw_set_default_source(final_node):
                     log.warning("Could not set default source to %s", final_node)
+                # Force mic volume to 100% — WirePlumber may restore a lower value
+                subprocess.run(
+                    ["wpctl", "set-volume", "@DEFAULT_SOURCE@", "1.0"],
+                    capture_output=True,
+                    timeout=3,
+                )
 
             # ── Stage 4: Speaker enhancement ──
             if self.spk_enabled and SPEAKER_CHAIN_CONF.is_file():
@@ -798,10 +844,11 @@ class PipelineManager:
                     save_config(self.config)
 
                 log.info("Spawning speaker-chain process")
+                spk_log = open(RUNTIME_DIR / "speaker-chain.log", "w")
                 self._spk_proc = subprocess.Popen(
                     ["pipewire", "-c", str(SPEAKER_CHAIN_CONF)],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
+                    stderr=spk_log,
                 )
 
                 if pw_wait_for_node(SPEAKER_SINK_NAME, timeout=6.0):
@@ -837,6 +884,7 @@ class PipelineManager:
         if not self._running:
             return True, "Already stopped"
 
+        self._transitioning = True
         log.info("Stopping pipeline")
 
         prev = self.config.get("previous_default_source")
@@ -852,27 +900,33 @@ class PipelineManager:
 
         self._kill_all()
         self._running = False
+        self._transitioning = False
         return True, "Pipeline stopped"
 
     def restart(self) -> tuple[bool, str]:
         with self._lock:
+            self._transitioning = True
             self._stop_locked()
             time.sleep(0.5)
-            return self._start_locked()
+            result = self._start_locked()
+            self._transitioning = False
+            return result
 
     # ── Health ──
 
     def check_health(self) -> bool:
-        if not self._running:
+        if not self._running or self._transitioning:
             return True
+        dead = []
         if self._fc_proc and self._fc_proc.poll() is not None:
-            log.error("filter-chain died (rc=%d)", self._fc_proc.returncode)
-            return False
+            dead.append(("filter-chain", self._fc_proc.returncode))
         if self._ec_proc and self._ec_proc.poll() is not None:
-            log.error("echo-cancel died (rc=%d)", self._ec_proc.returncode)
-            return False
+            dead.append(("echo-cancel", self._ec_proc.returncode))
         if self._spk_proc and self._spk_proc.poll() is not None:
-            log.error("speaker-chain died (rc=%d)", self._spk_proc.returncode)
+            dead.append(("speaker-chain", self._spk_proc.returncode))
+        if dead:
+            for name, rc in dead:
+                log.error("%s died (rc=%d)", name, rc)
             return False
         return True
 
@@ -888,20 +942,28 @@ class PipelineManager:
         return "(no output)"
 
     def _kill_all(self):
+        # Send SIGTERM to all processes first (non-blocking)
+        procs = []
         for attr in ("_fc_proc", "_ec_proc", "_spk_proc"):
             proc: subprocess.Popen | None = getattr(self, attr)
-            if proc is None:
-                continue
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 proc.terminate()
+                procs.append((attr, proc))
+            else:
+                setattr(self, attr, None)
+
+        # Wait for all in parallel with a single deadline
+        deadline = time.monotonic() + 2.0
+        for attr, proc in procs:
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                proc.kill()
                 try:
-                    proc.wait(timeout=3)
+                    proc.wait(timeout=0.5)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
+                    log.warning("Process %s (pid %d) did not die", attr, proc.pid)
             setattr(self, attr, None)
 
 
@@ -1370,8 +1432,32 @@ class ClearVoiceTray:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
+def _acquire_instance_lock() -> bool:
+    """Ensure only one ClearVoice instance runs. Returns True if we got the lock."""
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    # Check for stale PID
+    if PIDFILE.exists():
+        try:
+            old_pid = int(PIDFILE.read_text().strip())
+            os.kill(old_pid, 0)  # check if alive
+            # Process exists — another instance is running
+            return False
+        except (ProcessLookupError, ValueError):
+            pass  # stale pidfile, we can take over
+        except PermissionError:
+            return False  # alive but we can't signal it
+    PIDFILE.write_text(str(os.getpid()))
+    atexit.register(lambda: PIDFILE.unlink(missing_ok=True))
+    return True
+
+
 def main():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not _acquire_instance_lock():
+        print(f"{APP_NAME} is already running.", file=sys.stderr)
+        sys.exit(0)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
