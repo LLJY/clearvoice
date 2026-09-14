@@ -521,6 +521,7 @@ def _pw_conf_filter_chain(
 
 def _pw_conf_echo_cancel(
     target_source: str | None = None,
+    monitor_mode: bool = False,
     beamforming: bool = False,
     mic_geometry: str = "",
     source_name: str = EC_SOURCE_NAME,
@@ -562,6 +563,7 @@ def _pw_conf_echo_cancel(
         "    { name = libpipewire-module-adapter }\n"
         "    { name = libpipewire-module-echo-cancel\n"
         "        args = {\n"
+        f"            monitor.mode = {'true' if monitor_mode else 'false'}\n"
         "            library.name = aec/libspa-aec-webrtc\n"
         f'            aec.args     = "{aec_args}"\n'
         "            capture.props = {\n"
@@ -764,6 +766,7 @@ class PipelineManager:
 
                 conf = _pw_conf_echo_cancel(
                     target_source=source,
+                    monitor_mode=self.aec_enabled,
                     beamforming=self.bf_enabled,
                     mic_geometry=geometry,
                     source_name=ec_out_name,
