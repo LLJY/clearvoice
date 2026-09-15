@@ -6,12 +6,14 @@ APP_NAME="ClearVoice"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="$HOME/.local/share/$APP_ID"
 DESKTOP_DIR="$HOME/.config/autostart"
+WIREPLUMBER_CONFIG_DIR="$HOME/.config/wireplumber/wireplumber.conf.d"
+WIREPLUMBER_SCRIPT_DIR="$HOME/.local/share/wireplumber/scripts"
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 echo "Checking dependencies..."
 ok=true
 
-for cmd in pipewire pw-cli pw-dump wpctl pactl; do
+for cmd in pipewire pw-cli pw-dump wpctl pactl wireplumber; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "  MISSING: $cmd"
         ok=false
@@ -19,6 +21,17 @@ for cmd in pipewire pw-cli pw-dump wpctl pactl; do
         echo "  OK: $cmd"
     fi
 done
+
+if command -v wireplumber &>/dev/null; then
+    wireplumber_version=$(wireplumber --version)
+    wireplumber_version=${wireplumber_version##* }
+    IFS=. read -r wp_major wp_minor wp_patch <<<"$wireplumber_version"
+    wp_patch=${wp_patch%%-*}
+    if ((wp_major == 0 && (wp_minor < 5 || (wp_minor == 5 && wp_patch < 15)))); then
+        echo "  MISSING: WirePlumber >= 0.5.15 (found $wireplumber_version)"
+        ok=false
+    fi
+fi
 
 # LADSPA plugin
 ladspa_found=false
@@ -70,9 +83,16 @@ echo "Installing $APP_NAME..."
 
 mkdir -p "$INSTALL_DIR"
 cp "$SCRIPT_DIR/clearvoice.py" "$INSTALL_DIR/clearvoice.py"
+cp "$SCRIPT_DIR/speaker-chain.conf" "$INSTALL_DIR/speaker-chain.conf"
 chmod +x "$INSTALL_DIR/clearvoice.py"
+mkdir -p "$WIREPLUMBER_CONFIG_DIR" "$WIREPLUMBER_SCRIPT_DIR"
+cp "$SCRIPT_DIR/clearvoice-wireplumber.conf" \
+    "$WIREPLUMBER_CONFIG_DIR/90-clearvoice-lock.conf"
+cp "$SCRIPT_DIR/clearvoice-lock.lua" \
+    "$WIREPLUMBER_SCRIPT_DIR/90-clearvoice-lock.lua"
 
 echo "  Installed to $INSTALL_DIR/clearvoice.py"
+echo "  Installed WirePlumber base-mic policy"
 
 # ── Autostart .desktop file ──────────────────────────────────────────────────
 mkdir -p "$DESKTOP_DIR"
@@ -92,4 +112,6 @@ DESKTOP
 echo "  Autostart entry: $DESKTOP_DIR/$APP_ID.desktop"
 echo ""
 echo "Done. $APP_NAME will start on next login."
+echo "Restart audio policy once after installation:"
+echo "  systemctl --user restart wireplumber pipewire-pulse"
 echo "To start now:  python3 $INSTALL_DIR/clearvoice.py &"

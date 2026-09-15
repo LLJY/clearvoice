@@ -113,6 +113,11 @@ MIC_PRESETS = {
 DEFAULT_CONFIG = {
     "enabled": True,
     "source_device": None,
+    "input_gain_percent": 70,
+    "output_gain_percent": 100,
+    "speaker_gain_percent": 80,
+    "headphone_gain_percent": 100,
+    "lock_base_mic_audio": True,
     "noise_cancellation": {
         "enabled": True,
         "attenuation_limit_db": 100,
@@ -132,12 +137,22 @@ DEFAULT_CONFIG = {
     "speaker_enhancement": {
         "enabled": True,
     },
+    "studio_voice": {
+        "enabled": True,
+    },
     "previous_default_source": None,
     "previous_default_sink": None,
 }
 
 
 # ── Config I/O ────────────────────────────────────────────────────────────────
+
+
+def _clamp_percent(value, default: int) -> int:
+    try:
+        return max(0, min(100, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def load_config() -> dict:
@@ -150,6 +165,13 @@ def load_config() -> dict:
             _deep_merge(config, saved)
         except (json.JSONDecodeError, OSError) as exc:
             log.warning("Failed to load config: %s", exc)
+    for key in (
+        "input_gain_percent",
+        "output_gain_percent",
+        "speaker_gain_percent",
+        "headphone_gain_percent",
+    ):
+        config[key] = _clamp_percent(config.get(key), DEFAULT_CONFIG[key])
     return config
 
 
@@ -201,7 +223,13 @@ def check_dependencies() -> list[str]:
 def pw_list_sources() -> list[dict]:
     """Enumerate physical audio sources via pw-dump."""
     try:
-        result = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            ["pw-dump"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"},
+        )
         if result.returncode != 0:
             return []
         objects = json.loads(result.stdout)
@@ -254,6 +282,106 @@ def pw_get_default_sink() -> str:
         return ""
 
 
+def pactl_list_sinks() -> list[dict] | None:
+    """Return PulseAudio-compatible sink data, or None on query errors."""
+    try:
+        result = subprocess.run(
+            ["pactl", "--format=json", "list", "sinks"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            log.warning("Could not list sinks: %s", result.stderr.strip())
+            return None
+        sinks = json.loads(result.stdout)
+        if not isinstance(sinks, list) or not all(
+            isinstance(sink, dict) for sink in sinks
+        ):
+            log.warning("Unexpected sink list response")
+            return None
+        return sinks
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        log.warning("Could not list sinks: %s", exc)
+        return None
+
+
+def pw_get_sink_active_port(sink_name: str) -> str | None:
+    """Return the active port for exactly *sink_name*, if known."""
+    sinks = pactl_list_sinks()
+    if sinks is None:
+        return None
+    for sink in sinks:
+        if sink.get("name") == sink_name:
+            active_port = sink.get("active_port")
+            return active_port if isinstance(active_port, str) else None
+    return None
+
+
+def pw_move_playback_streams(physical_sink: str, new_sink: str) -> bool:
+    """Move normal playback streams between ClearVoice's managed sinks."""
+    sinks = pactl_list_sinks()
+    if sinks is None:
+        return False
+    sink_names = {
+        str(sink.get("index")): sink.get("name")
+        for sink in sinks
+        if sink.get("name") in (physical_sink, SPEAKER_SINK_NAME)
+        and sink.get("index") is not None
+    }
+    if not sink_names:
+        return False
+    try:
+        result = subprocess.run(
+            ["pactl", "--format=json", "list", "sink-inputs"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            log.warning("Could not list playback streams: %s", result.stderr.strip())
+            return False
+        sink_inputs = json.loads(result.stdout)
+        if not isinstance(sink_inputs, list):
+            log.warning("Unexpected playback stream list response")
+            return False
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        log.warning("Could not list playback streams: %s", exc)
+        return False
+
+    success = True
+    for sink_input in sink_inputs:
+        if not isinstance(sink_input, dict):
+            continue
+        current_sink = sink_names.get(str(sink_input.get("sink")))
+        properties = sink_input.get("properties", {})
+        node_name = properties.get("node.name", "") if isinstance(properties, dict) else ""
+        if not current_sink or current_sink == new_sink or str(node_name).startswith("clearvoice_"):
+            continue
+        index = sink_input.get("index")
+        if index is None:
+            continue
+        try:
+            result = subprocess.run(
+                ["pactl", "move-sink-input", str(index), new_sink],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode != 0:
+                log.warning(
+                    "Could not move playback stream %s to %s: %s",
+                    index,
+                    new_sink,
+                    result.stderr.strip(),
+                )
+                success = False
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("Could not move playback stream %s to %s: %s", index, new_sink, exc)
+            success = False
+    return success
+
+
 def pw_set_default_sink(node_id: int) -> bool:
     """Set default sink by PipeWire node ID via wpctl."""
     try:
@@ -262,16 +390,27 @@ def pw_set_default_sink(node_id: int) -> bool:
             capture_output=True,
             text=True,
             timeout=3,
+            env={**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"},
         )
         return r.returncode == 0
     except Exception:
         return False
 
 
-def pw_find_node_id(node_name: str) -> int | None:
+def pw_find_node_id(node_name: str, manager: bool = False) -> int | None:
     """Find a PipeWire node ID by node.name."""
     try:
-        r = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(
+            ["pw-dump"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=(
+                {**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"}
+                if manager
+                else None
+            ),
+        )
         if r.returncode != 0:
             return None
         for obj in json.loads(r.stdout):
@@ -282,6 +421,48 @@ def pw_find_node_id(node_name: str) -> int | None:
         return None
     except Exception:
         return None
+
+
+def pw_set_node_volume(node_name: str, percent: int) -> bool:
+    """Set a node volume through WirePlumber's manager-visible remote."""
+    node_id = pw_find_node_id(node_name, manager=True)
+    if node_id is None:
+        log.warning("Could not find node %s to set volume", node_name)
+        return False
+    percent = _clamp_percent(percent, 100)
+    try:
+        r = subprocess.run(
+            ["wpctl", "set-volume", str(node_id), f"{percent / 100:.2f}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env={**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"},
+        )
+        if r.returncode != 0:
+            log.warning("Could not set volume for %s: %s", node_name, r.stderr.strip())
+            return False
+        return True
+    except Exception as exc:
+        log.warning("Could not set volume for %s: %s", node_name, exc)
+        return False
+
+
+def wp_set_setting(key: str, value: str) -> bool:
+    """Set an optional dynamic WirePlumber policy setting without blocking startup."""
+    try:
+        r = subprocess.run(
+            ["wpctl", "settings", "--save", key, value],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if r.returncode != 0:
+            log.warning("Could not set WirePlumber setting %s: %s", key, r.stderr.strip())
+            return False
+        return True
+    except Exception as exc:
+        log.warning("Could not set WirePlumber setting %s: %s", key, exc)
+        return False
 
 
 class PipeWireMonitor:
@@ -385,12 +566,16 @@ class PipeWireMonitor:
 
 
 def pw_set_default_source(name: str) -> bool:
+    node_id = pw_find_node_id(name, manager=True)
+    if node_id is None:
+        return False
     try:
         r = subprocess.run(
-            ["pactl", "set-default-source", name],
+            ["wpctl", "set-default", str(node_id)],
             capture_output=True,
             text=True,
             timeout=3,
+            env={**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"},
         )
         return r.returncode == 0
     except Exception:
@@ -431,16 +616,89 @@ def _pw_conf_filter_chain(
     max_df_db: int = 35,
     post_filter_beta: float = 0.0,
     target_source: str | None = None,
+    studio_voice: bool = True,
 ) -> str:
     """Build a PipeWire config that loads a DeepFilterNet filter-chain."""
     target_line = ""
     if target_source:
         target_line = f'target.object = "{target_source}"'
 
+    studio_pre_nodes = ""
+    studio_post_nodes = ""
+    if studio_voice:
+        studio_pre_nodes = (
+            "                    { type = builtin name = hpf label = bq_highpass\n"
+            '                        control = { "Freq" = 70.0 "Q" = 0.707 } }\n'
+            "                    { type = builtin name = body label = bq_peaking\n"
+            '                        control = { "Freq" = 150.0 "Q" = 0.8 "Gain" = 1.5 } }\n'
+            "                    { type = builtin name = lowmid label = bq_peaking\n"
+            '                        control = { "Freq" = 350.0 "Q" = 1.0 "Gain" = -1.0 } }\n'
+        )
+        studio_post_nodes = (
+            "                    {\n"
+            "                        type   = lv2\n"
+            "                        name   = deesser\n"
+            '                        plugin = "http://calf.sourceforge.net/plugins/Deesser"\n'
+            "                        control = {\n"
+            '                            "bypass"    = 0\n'
+            '                            "detection" = 0\n'
+            '                            "mode"      = 1\n'
+            '                            "threshold" = 0.18\n'
+            '                            "ratio"     = 3.0\n'
+            '                            "laxity"    = 15\n'
+            '                            "makeup"    = 1.0\n'
+            '                            "f1_freq"   = 6000.0\n'
+            '                            "f2_freq"   = 6000.0\n'
+            "                        }\n"
+            "                    }\n"
+            "                    {\n"
+            "                        type   = lv2\n"
+            "                        name   = limiter\n"
+            '                        plugin = "http://calf.sourceforge.net/plugins/Limiter"\n'
+            "                        control = {\n"
+            '                            "bypass"       = 0\n'
+            '                            "level_in"     = 1.0\n'
+            '                            "level_out"    = 1.0\n'
+            '                            "limit"        = 0.891251\n'
+            '                            "attack"       = 0.5\n'
+            '                            "release"      = 50.0\n'
+            '                            "asc"          = 1\n'
+            '                            "asc_coeff"    = 0.5\n'
+            '                            "oversampling" = 1\n'
+            '                            "auto_level"   = 0\n'
+            "                        }\n"
+            "                    }\n"
+        )
+
+    if studio_voice:
+        links = (
+            '                    { output = "pretrim:Out" input = "deepfilter:Audio In" }\n'
+            '                    { output = "deepfilter:Audio Out" input = "restore:In" }\n'
+            '                    { output = "restore:Out" input = "hpf:In" }\n'
+            '                    { output = "hpf:Out" input = "body:In" }\n'
+            '                    { output = "body:Out" input = "lowmid:In" }\n'
+            '                    { output = "lowmid:Out" input = "agc:in_l" }\n'
+            '                    { output = "lowmid:Out" input = "agc:in_r" }\n'
+            '                    { output = "agc:out_l" input = "deesser:in_l" }\n'
+            '                    { output = "agc:out_r" input = "deesser:in_r" }\n'
+            '                    { output = "deesser:out_l" input = "limiter:in_l" }\n'
+            '                    { output = "deesser:out_r" input = "limiter:in_r" }\n'
+        )
+    else:
+        links = (
+            '                    { output = "pretrim:Out" input = "deepfilter:Audio In" }\n'
+            '                    { output = "deepfilter:Audio Out" input = "restore:In" }\n'
+            '                    { output = "restore:Out" input = "agc:in_l" }\n'
+            '                    { output = "restore:Out" input = "agc:in_r" }\n'
+        )
+
     return (
         "# ClearVoice filter-chain (auto-generated)\n"
         "context.properties = {\n"
         "    log.level = 0\n"
+        '    application.name = "ClearVoice"\n'
+        '    application.id = "org.clearvoice.ClearVoice"\n'
+        "    clearvoice.client = true\n"
         "}\n"
         "\n"
         "context.spa-libs = {\n"
@@ -462,6 +720,8 @@ def _pw_conf_filter_chain(
         f'            media.name       = "{VIRTUAL_MIC_DESC}"\n'
         "            filter.graph = {\n"
         "                nodes = [\n"
+        "                    { type = builtin name = pretrim label = linear\n"
+        '                        control = { "Mult" = 0.630957344 "Add" = 0.0 } }\n'
         "                    {\n"
         "                        type   = ladspa\n"
         "                        name   = deepfilter\n"
@@ -475,7 +735,10 @@ def _pw_conf_filter_chain(
         f'                            "Post Filter Beta" = {post_filter_beta}\n'
         "                        }\n"
         "                    }\n"
-        "                    # AGC: keeps voice at 80-95% regardless of input level\n"
+        "                    { type = builtin name = restore label = linear\n"
+        '                        control = { "Mult" = 1.584893192 "Add" = 0.0 } }\n'
+        f"{studio_pre_nodes}"
+        "                    # Calibrated output leveling\n"
         "                    {\n"
         "                        type   = lv2\n"
         "                        name   = agc\n"
@@ -494,10 +757,10 @@ def _pw_conf_filter_chain(
         '                            "mix"         = 1.0\n'  # 100% wet
         "                        }\n"
         "                    }\n"
+        f"{studio_post_nodes}"
         "                ]\n"
         "                links = [\n"
-        '                    { output = "deepfilter:Audio Out" input = "agc:in_l" }\n'
-        '                    { output = "deepfilter:Audio Out" input = "agc:in_r" }\n'
+        f"{links}"
         "                ]\n"
         "            }\n"
         "            capture.props = {\n"
@@ -540,11 +803,15 @@ def _pw_conf_echo_cancel(
     else:
         aec_parts.append("beamforming=0")
     aec_args = " ".join(aec_parts)
+    restore_props = "state.restore-props = false" if not is_intermediate else ""
 
     return (
         "# ClearVoice echo-cancel (auto-generated)\n"
         "context.properties = {\n"
         "    log.level = 0\n"
+        '    application.name = "ClearVoice"\n'
+        '    application.id = "org.clearvoice.ClearVoice"\n'
+        "    clearvoice.client = true\n"
         "}\n"
         "\n"
         "context.spa-libs = {\n"
@@ -575,6 +842,7 @@ def _pw_conf_echo_cancel(
         f'                node.description = "{source_desc}"\n'
         "                media.class      = Audio/Source\n"
         f"                {'priority.session = 0' if is_intermediate else ''}\n"
+        f"                {restore_props}\n"
         "            }\n"
         "            sink.props = {\n"
         '                node.name = "clearvoice_ec_sink"\n'
@@ -609,6 +877,10 @@ class PipelineManager:
         self._running = False
         self._transitioning = False  # True during stop/start — suppresses health checks
         self._lock = threading.Lock()
+        self._base_mic_node: str | None = None
+        self._physical_sink: str | None = None
+        self._headphone_mode = False
+        self._route_confirmed = False
 
         # Ensure child processes are cleaned up if we crash
         atexit.register(self._kill_all)
@@ -620,16 +892,24 @@ class PipelineManager:
         return self._running
 
     @property
+    def transitioning(self) -> bool:
+        return self._transitioning
+
+    @property
+    def headphone_mode(self) -> bool:
+        return self._headphone_mode
+
+    @property
     def nc_enabled(self) -> bool:
         return self.config["noise_cancellation"]["enabled"]
 
     @property
     def bf_enabled(self) -> bool:
-        return self.config["beamforming"]["enabled"]
+        return self.config["beamforming"]["enabled"] and not self._headphone_mode
 
     @property
     def aec_enabled(self) -> bool:
-        return self.config["echo_cancellation"]["enabled"]
+        return self.config["echo_cancellation"]["enabled"] and not self._headphone_mode
 
     @property
     def ec_needed(self) -> bool:
@@ -637,7 +917,14 @@ class PipelineManager:
 
     @property
     def spk_enabled(self) -> bool:
-        return self.config.get("speaker_enhancement", {}).get("enabled", False)
+        return (
+            self.config.get("speaker_enhancement", {}).get("enabled", False)
+            and not self._headphone_mode
+        )
+
+    @property
+    def studio_enabled(self) -> bool:
+        return self.config.get("studio_voice", {}).get("enabled", True)
 
     @property
     def any_processing(self) -> bool:
@@ -669,11 +956,172 @@ class PipelineManager:
         # Last resort: first physical source
         return next(iter(available), None)
 
+    # ── Output Route Resolution ──
+
+    def _resolve_physical_sink(self) -> str | None:
+        """Use the original non-ClearVoice sink as the route authority."""
+        sinks = pactl_list_sinks()
+        sink_names = {sink.get("name") for sink in sinks or []}
+        previous = self.config.get("previous_default_sink")
+        if (
+            isinstance(previous, str)
+            and previous
+            and not previous.startswith("clearvoice")
+            and (sinks is None or previous in sink_names)
+        ):
+            return previous
+
+        current = pw_get_default_sink()
+        if current and not current.startswith("clearvoice"):
+            self.config["previous_default_sink"] = current
+            save_config(self.config)
+            return current
+        return None
+
+    def detect_headphone_mode(self) -> bool | None:
+        """Return the currently confirmed route without changing stored mode."""
+        physical_sink = self._physical_sink or self._resolve_physical_sink()
+        if not physical_sink:
+            return None
+        active_port = pw_get_sink_active_port(physical_sink)
+        if active_port == "analog-output-headphones":
+            return True
+        if active_port == "analog-output-speaker":
+            return False
+        return None
+
+    def _refresh_headphone_mode(self):
+        mode = self.detect_headphone_mode()
+        if mode is None:
+            if not self._route_confirmed:
+                log.warning("Could not determine output route; defaulting to speaker mode")
+            return
+        self._headphone_mode = mode
+        self._route_confirmed = True
+
+    # ── Gain / Policy Management ──
+
+    @staticmethod
+    def _publish_lock_state(locked: bool) -> bool:
+        return wp_set_setting(
+            "clearvoice.lock-base-mic-audio", str(bool(locked)).lower()
+        )
+
+    @staticmethod
+    def _publish_base_mic_node(node_name: str) -> bool:
+        return wp_set_setting("clearvoice.base-mic-node", json.dumps(node_name))
+
+    @staticmethod
+    def _publish_input_gain(percent: int) -> bool:
+        return wp_set_setting("clearvoice.base-mic-gain", f"{percent / 100:.2f}")
+
+    def set_input_gain(self, percent: int) -> bool:
+        percent = _clamp_percent(percent, DEFAULT_CONFIG["input_gain_percent"])
+        self.config["input_gain_percent"] = percent
+        policy_set = self._publish_input_gain(percent)
+        source = self._base_mic_node or self._resolve_source()
+        if source:
+            self._base_mic_node = source
+            volume_set = pw_set_node_volume(source, percent)
+            return policy_set and volume_set
+        return False
+
+    def set_output_gain(self, percent: int) -> bool:
+        percent = _clamp_percent(percent, DEFAULT_CONFIG["output_gain_percent"])
+        self.config["output_gain_percent"] = percent
+        if pw_node_exists(VIRTUAL_MIC_NAME):
+            return pw_set_node_volume(VIRTUAL_MIC_NAME, percent)
+        return False
+
+    def set_route_gains(self, speaker_percent: int, headphone_percent: int) -> bool:
+        """Save and immediately apply the gain for the active output route."""
+        speaker_percent = _clamp_percent(
+            speaker_percent, DEFAULT_CONFIG["speaker_gain_percent"]
+        )
+        headphone_percent = _clamp_percent(
+            headphone_percent, DEFAULT_CONFIG["headphone_gain_percent"]
+        )
+        self.config["speaker_gain_percent"] = speaker_percent
+        self.config["headphone_gain_percent"] = headphone_percent
+        physical_sink = self._physical_sink or self._resolve_physical_sink()
+        if not physical_sink:
+            return False
+        if self._headphone_mode:
+            return pw_set_node_volume(physical_sink, headphone_percent)
+        if self.spk_enabled and pw_node_exists(SPEAKER_SINK_NAME):
+            return pw_set_node_volume(SPEAKER_SINK_NAME, speaker_percent)
+        return pw_set_node_volume(physical_sink, speaker_percent)
+
+    def _set_playback_sink(self, sink_name: str, gain_percent: int) -> bool:
+        """Set the sink volume and default, then move non-ClearVoice streams."""
+        gain_set = pw_set_node_volume(sink_name, gain_percent)
+        sink_id = pw_find_node_id(sink_name)
+        if sink_id is None:
+            log.warning("Could not find playback sink %s", sink_name)
+            return False
+        default_set = pw_set_default_sink(sink_id)
+        if not default_set:
+            log.warning("Could not set default playback sink to %s", sink_name)
+            return False
+        if self._physical_sink:
+            pw_move_playback_streams(self._physical_sink, sink_name)
+        return gain_set
+
+    def _start_playback_output(self):
+        """Activate the appropriate speaker or headphone playback route."""
+        physical_sink = self._physical_sink
+        if not physical_sink:
+            log.warning("No physical playback sink found; leaving playback route unchanged")
+            return
+        if self._headphone_mode:
+            self._set_playback_sink(
+                physical_sink, self.config["headphone_gain_percent"]
+            )
+            return
+        if not self.spk_enabled or not SPEAKER_CHAIN_CONF.is_file():
+            if not self.spk_enabled:
+                self._set_playback_sink(
+                    physical_sink, self.config["speaker_gain_percent"]
+                )
+            else:
+                log.warning("Speaker chain config not found; using physical speakers")
+                self._set_playback_sink(
+                    physical_sink, self.config["speaker_gain_percent"]
+                )
+            return
+
+        pw_set_node_volume(physical_sink, 100)
+        log.info("Spawning speaker-chain process")
+        spk_log = open(RUNTIME_DIR / "speaker-chain.log", "w")
+        self._spk_proc = subprocess.Popen(
+            ["pipewire", "-c", str(SPEAKER_CHAIN_CONF)],
+            stdout=subprocess.DEVNULL,
+            stderr=spk_log,
+        )
+        if pw_wait_for_node(SPEAKER_SINK_NAME, timeout=6.0):
+            self._set_playback_sink(
+                SPEAKER_SINK_NAME, self.config["speaker_gain_percent"]
+            )
+            log.info("Speaker chain ready: %s", SPEAKER_SINK_NAME)
+            return
+        log.warning("Speaker chain failed to start; using physical speakers")
+        self._set_playback_sink(physical_sink, self.config["speaker_gain_percent"])
+
+    def set_lock_base_mic_audio(self, locked: bool) -> bool:
+        self.config["lock_base_mic_audio"] = bool(locked)
+        if self._running:
+            return self._publish_lock_state(self.config["lock_base_mic_audio"])
+        return True
+
     # ── Start / Stop ──
 
     def start(self) -> tuple[bool, str]:
         with self._lock:
-            return self._start_locked()
+            try:
+                return self._start_locked()
+            except Exception as exc:
+                log.exception("Pipeline start failed")
+                return self._fail_start(str(exc))
 
     @staticmethod
     def _cleanup_orphans():
@@ -703,6 +1151,14 @@ class PipelineManager:
         if self._running:
             return True, "Already running"
 
+        self._running = False
+        self._base_mic_node = None
+        self._physical_sink = self._resolve_physical_sink()
+        self._refresh_headphone_mode()
+
+        # Fail open even if an earlier start attempt did not reach the final stage.
+        self._publish_lock_state(False)
+
         if not self.any_processing:
             return False, "Enable at least one processing feature"
 
@@ -724,10 +1180,11 @@ class PipelineManager:
                 return False, "No audio source device found"
 
         log.info(
-            "Starting pipeline — source=%s mic=%s spk=%s",
+            "Starting pipeline — source=%s mic=%s spk=%s hp=%s",
             source,
             needs_mic,
             self.spk_enabled,
+            self._headphone_mode,
         )
 
         # Remember current defaults so we can restore them
@@ -738,6 +1195,20 @@ class PipelineManager:
                 save_config(self.config)
 
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Make the eventual AEC monitor use the selected playback route.
+        self._start_playback_output()
+
+        if needs_mic:
+            self._base_mic_node = source
+            self._publish_lock_state(False)
+            base_node_ready = self._publish_base_mic_node(source)
+            input_gain_ready = self.set_input_gain(
+                self.config["input_gain_percent"]
+            )
+            base_mic_ready = base_node_ready and input_gain_ready
+            if self.config["lock_base_mic_audio"] and not base_mic_ready:
+                return self._fail_start("Could not prepare base mic audio lock")
 
         # Which node becomes the system default virtual mic?
         final_node = VIRTUAL_MIC_NAME if self.nc_enabled else VIRTUAL_MIC_NAME
@@ -787,8 +1258,7 @@ class PipelineManager:
                 if not pw_wait_for_node(ec_out_name, timeout=6.0):
                     ec_log.flush()
                     stderr = (RUNTIME_DIR / "echo-cancel.log").read_text()[-500:]
-                    self._kill_all()
-                    return False, f"Echo-cancel failed to start: {stderr}"
+                    return self._fail_start(f"Echo-cancel failed to start: {stderr}")
 
                 log.info("Echo-cancel ready: %s", ec_out_name)
                 final_node = ec_out_name
@@ -806,6 +1276,7 @@ class PipelineManager:
                     max_df_db=nc.get("max_df_threshold_db", 35),
                     post_filter_beta=nc.get("post_filter_beta", 0.0),
                     target_source=fc_target,
+                    studio_voice=self.studio_enabled,
                 )
                 conf_path = RUNTIME_DIR / "filter-chain.conf"
                 conf_path.write_text(conf)
@@ -821,63 +1292,34 @@ class PipelineManager:
                 if not pw_wait_for_node(VIRTUAL_MIC_NAME, timeout=6.0):
                     fc_log.flush()
                     stderr = (RUNTIME_DIR / "filter-chain.log").read_text()[-500:]
-                    self._kill_all()
-                    return False, f"Filter-chain failed to start: {stderr}"
+                    return self._fail_start(f"Filter-chain failed to start: {stderr}")
 
                 log.info("Filter-chain ready: %s", VIRTUAL_MIC_NAME)
                 final_node = VIRTUAL_MIC_NAME
 
-            # ── Stage 3: Set mic as default + force volume ──
+            # ── Stage 3: Set mic as default + configured output gain ──
             if needs_mic:
                 time.sleep(0.3)
+                output_gain_ready = self.set_output_gain(
+                    self.config["output_gain_percent"]
+                )
                 if not pw_set_default_source(final_node):
-                    log.warning("Could not set default source to %s", final_node)
-                # Force mic volume to 100% — WirePlumber may restore a lower value
-                subprocess.run(
-                    ["wpctl", "set-volume", "@DEFAULT_SOURCE@", "1.0"],
-                    capture_output=True,
-                    timeout=3,
-                )
+                    return self._fail_start(
+                        f"Could not set default source to {final_node}"
+                    )
+                if self.config["lock_base_mic_audio"] and not output_gain_ready:
+                    return self._fail_start("Could not prepare ClearVoice output gain lock")
 
-            # ── Stage 4: Speaker enhancement ──
-            if self.spk_enabled and SPEAKER_CHAIN_CONF.is_file():
-                current_sink = pw_get_default_sink()
-                if current_sink and not current_sink.startswith("clearvoice"):
-                    self.config["previous_default_sink"] = current_sink
-                    save_config(self.config)
-
-                log.info("Spawning speaker-chain process")
-                spk_log = open(RUNTIME_DIR / "speaker-chain.log", "w")
-                self._spk_proc = subprocess.Popen(
-                    ["pipewire", "-c", str(SPEAKER_CHAIN_CONF)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=spk_log,
-                )
-
-                if pw_wait_for_node(SPEAKER_SINK_NAME, timeout=6.0):
-                    sink_id = pw_find_node_id(SPEAKER_SINK_NAME)
-                    if sink_id:
-                        pw_set_default_sink(sink_id)
-                    log.info("Speaker chain ready: %s", SPEAKER_SINK_NAME)
-                else:
-                    log.warning("Speaker chain failed to start (non-fatal)")
+            lock_state = self.config["lock_base_mic_audio"] if needs_mic else False
+            if not self._publish_lock_state(lock_state):
+                return self._fail_start("Could not publish base mic audio lock policy")
 
             self._running = True
             return True, "Pipeline active"
 
         except Exception as exc:
             log.exception("Pipeline start failed")
-            # Restore defaults before killing processes
-            prev_src = self.config.get("previous_default_source")
-            if prev_src:
-                pw_set_default_source(prev_src)
-            prev_sink = self.config.get("previous_default_sink")
-            if prev_sink:
-                sink_id = pw_find_node_id(prev_sink)
-                if sink_id:
-                    pw_set_default_sink(sink_id)
-            self._kill_all()
-            return False, str(exc)
+            return self._fail_start(str(exc))
 
     def stop(self) -> tuple[bool, str]:
         with self._lock:
@@ -887,9 +1329,28 @@ class PipelineManager:
         if not self._running:
             return True, "Already stopped"
 
+        was_transitioning = self._transitioning
         self._transitioning = True
         log.info("Stopping pipeline")
 
+        self._publish_lock_state(False)
+        self._kill_all()
+        self._restore_previous_defaults()
+        self._base_mic_node = None
+        self._running = False
+        if not was_transitioning:
+            self._transitioning = False
+        return True, "Pipeline stopped"
+
+    def _fail_start(self, msg: str) -> tuple[bool, str]:
+        self._running = False
+        self._publish_lock_state(False)
+        self._kill_all()
+        self._restore_previous_defaults()
+        self._base_mic_node = None
+        return False, msg
+
+    def _restore_previous_defaults(self):
         prev = self.config.get("previous_default_source")
         if prev:
             pw_set_default_source(prev)
@@ -901,19 +1362,18 @@ class PipelineManager:
             if sink_id:
                 pw_set_default_sink(sink_id)
 
-        self._kill_all()
-        self._running = False
-        self._transitioning = False
-        return True, "Pipeline stopped"
-
     def restart(self) -> tuple[bool, str]:
         with self._lock:
             self._transitioning = True
-            self._stop_locked()
-            time.sleep(0.5)
-            result = self._start_locked()
-            self._transitioning = False
-            return result
+            try:
+                self._stop_locked()
+                time.sleep(0.5)
+                return self._start_locked()
+            except Exception as exc:
+                log.exception("Pipeline restart failed")
+                return self._fail_start(str(exc))
+            finally:
+                self._transitioning = False
 
     # ── Health ──
 
@@ -980,6 +1440,9 @@ class ClearVoiceTray:
         self.pipeline = pipeline
         self.config = config
         self._pw_monitor: PipeWireMonitor | None = None
+        self._route_probe_pending = False
+        self._route_restart_pending = False
+        self._quitting = False
 
         if HAS_APPINDICATOR:
             self.indicator = AppIndicator.Indicator.new(
@@ -1004,6 +1467,9 @@ class ClearVoiceTray:
 
         # Process health check (10s)
         GLib.timeout_add_seconds(10, self._on_health_tick)
+
+        # Jack-route probes run off the GTK thread.
+        GLib.timeout_add_seconds(2, self._on_route_tick)
 
         # Event-driven node state monitor
         self._pw_monitor = PipeWireMonitor(on_state_change=self._on_pw_state_change)
@@ -1041,6 +1507,15 @@ class ClearVoiceTray:
         self._source_submenu.connect("show", self._on_source_menu_show)
         m.append(src)
 
+        self._mi_lock_base_mic = Gtk.CheckMenuItem(label="Lock Base Mic Audio")
+        self._mi_lock_base_mic.set_active(self.config["lock_base_mic_audio"])
+        self._mi_lock_base_mic.connect("toggled", self._on_lock_base_mic)
+        m.append(self._mi_lock_base_mic)
+
+        mi_gains = Gtk.MenuItem(label="Audio Gains…")
+        mi_gains.connect("activate", self._on_audio_gains)
+        m.append(mi_gains)
+
         m.append(Gtk.SeparatorMenuItem())
 
         # ── Noise Cancellation ──
@@ -1073,6 +1548,11 @@ class ClearVoiceTray:
         mi_adv = Gtk.MenuItem(label="    Advanced...")
         mi_adv.connect("activate", self._on_nc_advanced)
         m.append(mi_adv)
+
+        self._mi_studio = Gtk.CheckMenuItem(label="Studio Voice")
+        self._mi_studio.set_active(self.config["studio_voice"]["enabled"])
+        self._mi_studio.connect("toggled", self._on_studio_voice)
+        m.append(self._mi_studio)
 
         m.append(Gtk.SeparatorMenuItem())
 
@@ -1156,6 +1636,7 @@ class ClearVoiceTray:
 
             threading.Thread(target=_do, daemon=True).start()
         else:
+            self._route_restart_pending = False
             self.pipeline.stop()
             self._update_icon()
             self._update_status()
@@ -1194,8 +1675,109 @@ class ClearVoiceTray:
         if self.pipeline.running:
             self._async_restart()
 
+    def _on_lock_base_mic(self, item):
+        locked = item.get_active()
+        previous = self.config["lock_base_mic_audio"]
+        if locked == previous:
+            return
+        self.config["lock_base_mic_audio"] = locked
+        save_config(self.config)
+        item.set_sensitive(False)
+
+        def _do():
+            if self.pipeline.set_lock_base_mic_audio(locked):
+                GLib.idle_add(item.set_sensitive, True)
+                return
+
+            def _restore():
+                self.config["lock_base_mic_audio"] = previous
+                save_config(self.config)
+                item.set_active(previous)
+                item.set_sensitive(True)
+                self._show_error("Could not update base mic audio lock policy")
+
+            GLib.idle_add(_restore)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_audio_gains(self, _item):
+        dialog = Gtk.Dialog(title="Audio Gains", transient_for=None, flags=0)
+        dialog.set_default_size(720, -1)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OK,
+            Gtk.ResponseType.OK,
+        )
+        box = dialog.get_content_area()
+        box.set_spacing(6)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+
+        scales = {}
+        for label_text, key in [
+            ("Base Mic Gain", "input_gain_percent"),
+            ("ClearVoice Mic Output Gain", "output_gain_percent"),
+            ("Speaker Gain", "speaker_gain_percent"),
+            ("Headphone Gain", "headphone_gain_percent"),
+        ]:
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            label = Gtk.Label(label=label_text)
+            label.set_xalign(0)
+            hbox.pack_start(label, False, False, 0)
+            scale = Gtk.Scale(
+                orientation=Gtk.Orientation.HORIZONTAL,
+                adjustment=Gtk.Adjustment(
+                    value=self.config[key],
+                    lower=0,
+                    upper=100,
+                    step_increment=1,
+                    page_increment=10,
+                ),
+            )
+            scale.set_digits(0)
+            scale.set_draw_value(True)
+            scale.set_hexpand(True)
+            hbox.pack_start(scale, True, True, 0)
+            box.add(hbox)
+            scales[key] = scale
+
+        dialog.show_all()
+        if dialog.run() == Gtk.ResponseType.OK:
+            input_gain = int(scales["input_gain_percent"].get_value())
+            output_gain = int(scales["output_gain_percent"].get_value())
+            speaker_gain = int(scales["speaker_gain_percent"].get_value())
+            headphone_gain = int(scales["headphone_gain_percent"].get_value())
+            self.config["input_gain_percent"] = input_gain
+            self.config["output_gain_percent"] = output_gain
+            self.config["speaker_gain_percent"] = speaker_gain
+            self.config["headphone_gain_percent"] = headphone_gain
+            save_config(self.config)
+
+            def _apply_gains():
+                input_ok = self.pipeline.set_input_gain(input_gain)
+                output_ok = self.pipeline.set_output_gain(output_gain)
+                route_ok = self.pipeline.set_route_gains(speaker_gain, headphone_gain)
+                if not input_ok or not output_ok or not route_ok:
+                    GLib.idle_add(
+                        self._show_error,
+                        "Could not apply one or more audio gains. "
+                        "Saved values will be retried when ClearVoice starts.",
+                    )
+
+            threading.Thread(target=_apply_gains, daemon=True).start()
+        dialog.destroy()
+
     def _on_nc(self, item):
         self.config["noise_cancellation"]["enabled"] = item.get_active()
+        save_config(self.config)
+        if self.pipeline.running:
+            self._async_restart()
+
+    def _on_studio_voice(self, item):
+        self.config["studio_voice"]["enabled"] = item.get_active()
         save_config(self.config)
         if self.pipeline.running:
             self._async_restart()
@@ -1350,6 +1932,8 @@ class ClearVoiceTray:
             self._async_restart()
 
     def _on_quit(self, _item):
+        self._quitting = True
+        self._route_restart_pending = False
         if self._pw_monitor:
             self._pw_monitor.stop()
         self.pipeline.stop()
@@ -1363,18 +1947,69 @@ class ClearVoiceTray:
 
     # ── Helpers ──
 
-    def _async_restart(self):
+    def _async_restart(self, route_restart: bool = False):
         """Restart the pipeline off the GTK thread."""
+        if route_restart:
+            if self._route_restart_pending:
+                return
+            self._route_restart_pending = True
 
         def _do():
+            if route_restart and (self._quitting or not self.config.get("enabled", True)):
+                GLib.idle_add(self._finish_async_restart, None, None, True)
+                return
             ok, msg = self.pipeline.restart()
-            GLib.idle_add(self._update_icon)
-            GLib.idle_add(self._update_status)
-            if not ok:
-                GLib.idle_add(self._show_error, msg)
-                GLib.idle_add(self._mi_enable.set_active, False)
+            GLib.idle_add(self._finish_async_restart, ok, msg, route_restart)
 
         threading.Thread(target=_do, daemon=True).start()
+
+    def _finish_async_restart(self, ok: bool | None, msg: str | None, route_restart: bool):
+        if route_restart:
+            self._route_restart_pending = False
+        if ok is None:
+            return False
+        self._update_icon()
+        self._update_status()
+        if not ok:
+            self._show_error(msg)
+            self._mi_enable.set_active(False)
+        return False
+
+    def _on_route_tick(self):
+        if (
+            self._quitting
+            or not self.config.get("enabled", True)
+            or not self.pipeline.running
+            or self.pipeline.transitioning
+            or self._route_probe_pending
+            or self._route_restart_pending
+        ):
+            return True
+        self._route_probe_pending = True
+
+        def _probe():
+            try:
+                mode = self.pipeline.detect_headphone_mode()
+            except Exception as exc:
+                log.warning("Could not probe output route: %s", exc)
+                mode = None
+            GLib.idle_add(self._on_route_probe_complete, mode)
+
+        threading.Thread(target=_probe, daemon=True).start()
+        return True
+
+    def _on_route_probe_complete(self, mode: bool | None):
+        self._route_probe_pending = False
+        if (
+            mode is not None
+            and not self._quitting
+            and self.config.get("enabled", True)
+            and self.pipeline.running
+            and not self.pipeline.transitioning
+            and mode != self.pipeline.headphone_mode
+        ):
+            self._async_restart(route_restart=True)
+        return False
 
     def _update_icon(self, nodes_active: bool = False):
         if not self.pipeline.running:
@@ -1399,6 +2034,8 @@ class ClearVoiceTray:
                 parts.append("AEC")
             if self.pipeline.spk_enabled:
                 parts.append("SPK")
+            if self.pipeline.headphone_mode:
+                parts.append("HP")
             tag = "+".join(parts) or "enabled"
             state = "Processing" if nodes_active else "Standby"
             self._mi_status.set_label(f"{state} [{tag}]")
@@ -1500,6 +2137,8 @@ def main():
 
     # Clean shutdown on signals
     def _shutdown(*_args):
+        tray._quitting = True
+        tray._route_restart_pending = False
         if tray._pw_monitor:
             tray._pw_monitor.stop()
         pipeline.stop()
