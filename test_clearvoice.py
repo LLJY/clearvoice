@@ -244,6 +244,23 @@ def test_beamformer_rejects_wrong_or_deleted_private_plugin_mapping():
             assert not clearvoice.pw_private_aec_plugin_loaded(42, private_plugin)
 
 
+def test_private_deepfilter_requires_pinned_revision():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        plugin = root / "libdeep_filter_ladspa.so"
+        revision = root / "libdeep_filter_ladspa.revision"
+        plugin.write_text("plugin")
+        with (
+            patch.object(clearvoice, "PRIVATE_DEEPFILTER_PLUGIN", plugin),
+            patch.object(clearvoice, "PRIVATE_DEEPFILTER_REVISION", revision),
+        ):
+            assert not clearvoice.private_deepfilter_ready()
+            revision.write_text("wrong")
+            assert not clearvoice.private_deepfilter_ready()
+            revision.write_text(clearvoice.REQUIRED_DEEPFILTER_REVISION)
+            assert clearvoice.private_deepfilter_ready()
+
+
 def test_beamforming_preflight_failure_fails_open_without_changing_preferences():
     config = _config()
     config["noise_cancellation"]["enabled"] = False

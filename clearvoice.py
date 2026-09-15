@@ -58,6 +58,10 @@ PRIVATE_SPA_ROOT = Path.home() / ".local/lib/clearvoice/spa-0.2"
 PRIVATE_AEC_PLUGIN = PRIVATE_SPA_ROOT / "aec/libspa-aec-webrtc.so"
 SYSTEM_SPA_ROOT = Path("/usr/lib/spa-0.2")
 REQUIRED_PIPEWIRE_VERSION = "1.6.8"
+PRIVATE_LADSPA_ROOT = Path.home() / ".local/lib/clearvoice/ladspa"
+PRIVATE_DEEPFILTER_PLUGIN = PRIVATE_LADSPA_ROOT / "libdeep_filter_ladspa.so"
+PRIVATE_DEEPFILTER_REVISION = PRIVATE_LADSPA_ROOT / "libdeep_filter_ladspa.revision"
+REQUIRED_DEEPFILTER_REVISION = "a20ca9f6c201b3661842901d085dee7b0a81a45c"
 
 # PipeWire node names
 VIRTUAL_MIC_NAME = "clearvoice_source"
@@ -71,6 +75,7 @@ DEEPFILTER_LABEL_MONO = "deep_filter_mono"
 DEEPFILTER_LABEL_STEREO = "deep_filter_stereo"
 
 LADSPA_SEARCH_PATHS = [
+    str(PRIVATE_LADSPA_ROOT),
     "/usr/lib/ladspa",
     "/usr/lib64/ladspa",
     "/usr/local/lib/ladspa",
@@ -339,6 +344,17 @@ def pw_private_aec_plugin_loaded(pid: int, plugin: Path) -> bool:
     except OSError:
         pass
     return False
+
+
+def private_deepfilter_ready() -> bool:
+    try:
+        return (
+            PRIVATE_DEEPFILTER_PLUGIN.is_file()
+            and PRIVATE_DEEPFILTER_REVISION.read_text().strip()
+            == REQUIRED_DEEPFILTER_REVISION
+        )
+    except OSError:
+        return False
 
 
 def pw_wait_for_beamformed_source(
@@ -1620,6 +1636,18 @@ class PipelineManager:
                     fc_log.flush()
                     stderr = (RUNTIME_DIR / "filter-chain.log").read_text()[-500:]
                     return self._fail_start(f"Filter-chain failed to start: {stderr}")
+
+                if Path(plugin_path) == PRIVATE_DEEPFILTER_PLUGIN:
+                    if not private_deepfilter_ready():
+                        return self._fail_start(
+                            "Private DeepFilter plugin revision is missing or invalid"
+                        )
+                    if not pw_private_aec_plugin_loaded(
+                        self._fc_proc.pid, PRIVATE_DEEPFILTER_PLUGIN
+                    ):
+                        return self._fail_start(
+                            "Private DeepFilter plugin is not mapped by filter-chain"
+                        )
 
                 log.info("Filter-chain ready: %s", VIRTUAL_MIC_NAME)
                 final_node = VIRTUAL_MIC_NAME

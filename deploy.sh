@@ -9,6 +9,7 @@ DESKTOP_DIR="$HOME/.config/autostart"
 WIREPLUMBER_CONFIG_DIR="$HOME/.config/wireplumber/wireplumber.conf.d"
 WIREPLUMBER_SCRIPT_DIR="$HOME/.local/share/wireplumber/scripts"
 PRIVATE_BEAMFORMER="$HOME/.local/lib/clearvoice/spa-0.2/aec/libspa-aec-webrtc.so"
+PRIVATE_DEEPFILTER="$HOME/.local/lib/clearvoice/ladspa/libdeep_filter_ladspa.so"
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 echo "Checking dependencies..."
@@ -96,6 +97,9 @@ echo "  Installed to $INSTALL_DIR/clearvoice.py"
 echo "  Installed WirePlumber base-mic policy"
 if [[ ! -f "$PRIVATE_BEAMFORMER" ]]; then
     echo "  WARNING: private beamformer missing; run ./build-beamformer.sh"
+fi
+if [[ ! -f "$PRIVATE_DEEPFILTER" ]]; then
+    echo "  WARNING: private DeepFilter missing; run ./build-deepfilter.sh"
 fi
 
 # ── Autostart .desktop file ──────────────────────────────────────────────────
