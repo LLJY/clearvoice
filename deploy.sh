@@ -8,6 +8,7 @@ INSTALL_DIR="$HOME/.local/share/$APP_ID"
 DESKTOP_DIR="$HOME/.config/autostart"
 WIREPLUMBER_CONFIG_DIR="$HOME/.config/wireplumber/wireplumber.conf.d"
 WIREPLUMBER_SCRIPT_DIR="$HOME/.local/share/wireplumber/scripts"
+PRIVATE_BEAMFORMER="$HOME/.local/lib/clearvoice/spa-0.2/aec/libspa-aec-webrtc.so"
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 echo "Checking dependencies..."
@@ -93,6 +94,9 @@ cp "$SCRIPT_DIR/clearvoice-lock.lua" \
 
 echo "  Installed to $INSTALL_DIR/clearvoice.py"
 echo "  Installed WirePlumber base-mic policy"
+if [[ ! -f "$PRIVATE_BEAMFORMER" ]]; then
+    echo "  WARNING: private beamformer missing; run ./build-beamformer.sh"
+fi
 
 # ── Autostart .desktop file ──────────────────────────────────────────────────
 mkdir -p "$DESKTOP_DIR"

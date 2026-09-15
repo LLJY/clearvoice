@@ -8,7 +8,9 @@ WebRTC-based beamforming, and acoustic echo cancellation via PipeWire.
 import atexit
 import json
 import logging
+import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -51,6 +53,11 @@ RUNTIME_DIR = (
     Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/run-{os.getuid()}")) / APP_ID
 )
 PIDFILE = RUNTIME_DIR / "clearvoice.pid"
+
+PRIVATE_SPA_ROOT = Path.home() / ".local/lib/clearvoice/spa-0.2"
+PRIVATE_AEC_PLUGIN = PRIVATE_SPA_ROOT / "aec/libspa-aec-webrtc.so"
+SYSTEM_SPA_ROOT = Path("/usr/lib/spa-0.2")
+REQUIRED_PIPEWIRE_VERSION = "1.6.8"
 
 # PipeWire node names
 VIRTUAL_MIC_NAME = "clearvoice_source"
@@ -96,10 +103,6 @@ MIC_PRESETS = {
     "laptop-dual-40mm": {
         "label": "Dual 40mm (Compact)",
         "geometry": "-0.02,0,0,0.02,0,0",
-    },
-    "laptop-triple-linear": {
-        "label": "Triple Linear 40mm",
-        "geometry": "-0.04,0,0,0,0,0,0.04,0,0",
     },
     "webcam-stereo": {
         "label": "Webcam Stereo 100mm",
@@ -218,6 +221,164 @@ def check_dependencies() -> list[str]:
 
 
 # ── PipeWire Helpers ──────────────────────────────────────────────────────────
+
+
+def pw_dump_objects(manager: bool = False) -> list[dict]:
+    """Return PipeWire objects, optionally through WirePlumber's manager remote."""
+    try:
+        result = subprocess.run(
+            ["pw-dump"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=(
+                {**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"}
+                if manager
+                else None
+            ),
+        )
+        if result.returncode != 0:
+            return []
+        objects = json.loads(result.stdout)
+        return objects if isinstance(objects, list) else []
+    except Exception as exc:
+        log.error("Failed to query PipeWire objects: %s", exc)
+        return []
+
+
+def _pw_output_ports(objects: list[dict], node_id: int) -> list[dict]:
+    """Return output port properties for one PipeWire node."""
+    ports = []
+    for obj in objects:
+        if obj.get("type") != "PipeWire:Interface:Port":
+            continue
+        info = obj.get("info", {})
+        props = info.get("props", {})
+        direction = props.get("port.direction", info.get("direction"))
+        if str(props.get("node.id")) == str(node_id) and direction in ("out", "output"):
+            ports.append(props)
+    return ports
+
+
+def pw_source_has_separate_fl_fr(source_name: str) -> bool:
+    """Return whether a manager-visible source exposes individual FL and FR ports."""
+    objects = pw_dump_objects(manager=True)
+    nodes = [
+        obj
+        for obj in objects
+        if obj.get("type") == "PipeWire:Interface:Node"
+        and obj.get("info", {}).get("props", {}).get("node.name") == source_name
+    ]
+    if len(nodes) != 1:
+        return False
+    channels = {
+        props.get("audio.channel") for props in _pw_output_ports(objects, nodes[0]["id"])
+    }
+    return "FL" in channels and "FR" in channels
+
+
+def pw_pipewire_versions() -> tuple[str | None, str | None]:
+    """Return PipeWire's compiled and linked libpipewire versions."""
+    try:
+        result = subprocess.run(
+            ["pipewire", "--version"], capture_output=True, text=True, timeout=3
+        )
+        if result.returncode != 0:
+            return None, None
+        compiled = re.search(
+            r"^Compiled with libpipewire\s+(\S+)$", result.stdout, re.MULTILINE
+        )
+        linked = re.search(
+            r"^Linked with libpipewire\s+(\S+)$", result.stdout, re.MULTILINE
+        )
+        return (
+            compiled.group(1) if compiled else None,
+            linked.group(1) if linked else None,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+
+
+def serialize_mic_geometry(geometry: str) -> str:
+    """Validate two microphone points and serialize them for the WebRTC backend."""
+    if not isinstance(geometry, str):
+        raise ValueError("geometry must be comma-separated numeric coordinates")
+    try:
+        values = [float(value.strip()) for value in geometry.split(",")]
+    except ValueError as exc:
+        raise ValueError("geometry must contain numeric coordinates") from exc
+    if len(values) != 6:
+        raise ValueError("geometry must contain exactly two microphone points")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("geometry coordinates must be finite")
+    if values[:3] == values[3:]:
+        raise ValueError("microphone points must be distinct")
+    return json.dumps([values[:3], values[3:]], separators=(",", ":"), allow_nan=False)
+
+
+def _private_aec_plugin_path() -> Path | None:
+    """Return the private AEC plugin's exact real path when it exists."""
+    try:
+        plugin = PRIVATE_AEC_PLUGIN.resolve(strict=True)
+    except OSError:
+        return None
+    return plugin if plugin.is_file() else None
+
+
+def pw_private_aec_plugin_loaded(pid: int, plugin: Path) -> bool:
+    """Verify that *pid* mapped the expected private AEC plugin without deletion."""
+    try:
+        plugin = plugin.resolve(strict=True)
+        inode = str(plugin.stat().st_ino)
+        for line in Path(f"/proc/{pid}/maps").read_text().splitlines():
+            if "(deleted)" in line:
+                continue
+            fields = line.split(maxsplit=5)
+            if len(fields) == 6 and fields[4] == inode and fields[5] == str(plugin):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def pw_wait_for_beamformed_source(
+    node_name: str, pid: int, timeout: float = 6.0
+) -> tuple[bool, str]:
+    """Wait for one PID-owned, mono beamformer output on the manager remote."""
+    deadline = time.monotonic() + timeout
+    reason = "beamformer source did not appear"
+    while time.monotonic() < deadline:
+        objects = pw_dump_objects(manager=True)
+        clients = [
+            obj
+            for obj in objects
+            if obj.get("type") == "PipeWire:Interface:Client"
+            and str(obj.get("info", {}).get("props", {}).get("application.process.id"))
+            == str(pid)
+        ]
+        nodes = [
+            obj
+            for obj in objects
+            if obj.get("type") == "PipeWire:Interface:Node"
+            and obj.get("info", {}).get("props", {}).get("node.name") == node_name
+            and obj.get("info", {}).get("props", {}).get("media.class") == "Audio/Source"
+        ]
+        if len(nodes) > 1:
+            return False, "beamformer source name is ambiguous"
+        if nodes:
+            props = nodes[0].get("info", {}).get("props", {})
+            if len(clients) != 1:
+                reason = "beamformer process client did not appear"
+                time.sleep(0.1)
+                continue
+            if str(props.get("client.id")) != str(clients[0]["id"]):
+                return False, "beamformer source is not owned by its echo-cancel process"
+            ports = _pw_output_ports(objects, nodes[0]["id"])
+            if len(ports) == 1 and ports[0].get("audio.channel") == "MONO":
+                return True, ""
+            reason = "beamformer source did not expose exactly one MONO output port"
+        time.sleep(0.1)
+    return False, reason
 
 
 def pw_list_sources() -> list[dict]:
@@ -466,10 +627,10 @@ def wp_set_setting(key: str, value: str) -> bool:
 
 
 class PipeWireMonitor:
-    """Event-driven PipeWire node state monitor via ``pw-dump --monitor``.
+    """Monitor whether an external client consumes the ClearVoice source.
 
-    Fires *on_state_change(bool)* when any clearvoice node transitions
-    to/from 'running'. Zero CPU when nothing changes.
+    Fires *on_state_change(bool)* when a link to ``clearvoice_source``
+    appears or disappears. Zero CPU when nothing changes.
     """
 
     def __init__(self, on_state_change: callable):
@@ -478,6 +639,7 @@ class PipeWireMonitor:
         self._thread: threading.Thread | None = None
         self._active = False
         self._enabled = False
+        self._objects: dict[int, dict] = {}
 
     @property
     def nodes_active(self) -> bool:
@@ -488,7 +650,13 @@ class PipeWireMonitor:
             return
         self._enabled = True
         self._proc = subprocess.Popen(
-            ["pw-dump", "--monitor", "--no-colors"],
+            [
+                "pw-dump",
+                "-r",
+                "pipewire-0-manager",
+                "--monitor",
+                "--no-colors",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,  # unbuffered
@@ -533,7 +701,7 @@ class PipeWireMonitor:
             log.debug("PipeWire monitor read error: %s", exc)
 
     def _check_diff(self, raw: bytes):
-        """Scan a JSON chunk for clearvoice node state changes."""
+        """Update the graph snapshot and detect external source consumers."""
         try:
             objects = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
@@ -541,28 +709,81 @@ class PipeWireMonitor:
         if not isinstance(objects, list):
             return
 
-        now_active = False
-        found_ours = False
         for obj in objects:
             if not isinstance(obj, dict):
                 continue
-            info = obj.get("info")
-            if not isinstance(info, dict):
+            object_id = obj.get("id")
+            if not isinstance(object_id, int):
                 continue
-            props = info.get("props")
-            if not isinstance(props, dict):
+            if obj.get("type") is None or obj.get("info") is None:
+                self._objects.pop(object_id, None)
+            else:
+                self._objects[object_id] = obj
+
+        nodes = {
+            obj["id"]: obj.get("info", {}).get("props", {})
+            for obj in self._objects.values()
+            if obj.get("type") == "PipeWire:Interface:Node"
+        }
+        final_nodes = {
+            node_id
+            for node_id, props in nodes.items()
+            if props.get("node.name") == VIRTUAL_MIC_NAME
+        }
+        ports = {
+            obj["id"]: obj.get("info", {}).get("props", {})
+            for obj in self._objects.values()
+            if obj.get("type") == "PipeWire:Interface:Port"
+        }
+        final_outputs = {
+            port_id
+            for port_id, props in ports.items()
+            if props.get("node.id") in final_nodes
+            and props.get("port.direction") == "out"
+        }
+        now_active = False
+        for obj in self._objects.values():
+            if obj.get("type") != "PipeWire:Interface:Link":
                 continue
-            name = props.get("node.name", "")
-            if not name.startswith("clearvoice"):
+            info = obj.get("info", {})
+            if info.get("output-port-id") not in final_outputs:
                 continue
-            found_ours = True
-            if info.get("state") == "running":
+            input_props = ports.get(info.get("input-port-id"), {})
+            target_props = nodes.get(input_props.get("node.id"), {})
+            if not str(target_props.get("node.name", "")).startswith("clearvoice"):
                 now_active = True
                 break
 
-        if found_ours and now_active != self._active:
+        if now_active != self._active:
             self._active = now_active
             GLib.idle_add(self.on_state_change, now_active)
+
+
+def pw_link_ports(output_port: str, input_port: str, connect: bool) -> bool:
+    """Create or remove one managed PipeWire link."""
+    command = ["pw-link"]
+    if not connect:
+        command.append("--disconnect")
+    command.extend((output_port, input_port))
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env={**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"},
+        )
+        if result.returncode != 0 and connect:
+            log.warning(
+                "Could not link %s to %s: %s",
+                output_port,
+                input_port,
+                result.stderr.strip(),
+            )
+        return result.returncode == 0 or not connect
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("Could not update PipeWire link: %s", exc)
+        return False
 
 
 def pw_set_default_source(name: str) -> bool:
@@ -796,12 +1017,29 @@ def _pw_conf_echo_cancel(
     if target_source:
         target_line = f'target.object = "{target_source}"'
 
-    aec_parts = []
-    if beamforming and mic_geometry:
-        aec_parts.append("beamforming=1")
-        aec_parts.append(f"mic_geometry={mic_geometry}")
-    else:
-        aec_parts.append("beamforming=0")
+    aec_parts = [
+        "webrtc.noise_suppression=false",
+        "webrtc.high_pass_filter=false",
+        "webrtc.gain_control=false",
+        "webrtc.voice_detection=false",
+        "webrtc.transient_suppression=false",
+    ]
+    capture_props = ""
+    if beamforming:
+        mic_geometry = serialize_mic_geometry(mic_geometry)
+        aec_parts.extend(
+            [
+                "webrtc.beamforming=true",
+                f"webrtc.mic-geometry={mic_geometry}",
+                "webrtc.target-direction=[1.5707963,0,1]",
+            ]
+        )
+        capture_props = (
+            "                audio.rate = 48000\n"
+            "                audio.channels = 2\n"
+            "                audio.position = [ FL FR ]\n"
+            "                stream.dont-remix = true\n"
+        )
     aec_args = " ".join(aec_parts)
     restore_props = "state.restore-props = false" if not is_intermediate else ""
 
@@ -835,7 +1073,9 @@ def _pw_conf_echo_cancel(
         f'            aec.args     = "{aec_args}"\n'
         "            capture.props = {\n"
         '                node.name = "clearvoice_ec_capture"\n'
+        "                node.autoconnect = false\n"
         f"                {target_line}\n"
+        f"{capture_props}"
         "            }\n"
         "            source.props = {\n"
         f'                node.name        = "{source_name}"\n'
@@ -846,6 +1086,7 @@ def _pw_conf_echo_cancel(
         "            }\n"
         "            sink.props = {\n"
         '                node.name = "clearvoice_ec_sink"\n'
+        "                node.autoconnect = false\n"
         "            }\n"
         "            playback.props = {\n"
         '                node.name    = "clearvoice_ec_playback"\n'
@@ -881,6 +1122,8 @@ class PipelineManager:
         self._physical_sink: str | None = None
         self._headphone_mode = False
         self._route_confirmed = False
+        self._mic_demand = False
+        self._aec_links_active = False
 
         # Ensure child processes are cleaned up if we crash
         atexit.register(self._kill_all)
@@ -1107,10 +1350,57 @@ class PipelineManager:
         log.warning("Speaker chain failed to start; using physical speakers")
         self._set_playback_sink(physical_sink, self.config["speaker_gain_percent"])
 
+    @staticmethod
+    def _echo_child_env(beamforming: bool) -> dict[str, str]:
+        """Select the SPA tree deterministically without changing module lookup."""
+        env = os.environ.copy()
+        env["SPA_PLUGIN_DIR"] = (
+            f"{PRIVATE_SPA_ROOT}:{SYSTEM_SPA_ROOT}" if beamforming else str(SYSTEM_SPA_ROOT)
+        )
+        return env
+
     def set_lock_base_mic_audio(self, locked: bool) -> bool:
         self.config["lock_base_mic_audio"] = bool(locked)
         if self._running:
             return self._publish_lock_state(self.config["lock_base_mic_audio"])
+        return True
+
+    def set_mic_demand(self, active: bool) -> bool:
+        """Connect AEC inputs only while an external app consumes the mic."""
+        self._mic_demand = bool(active)
+        if not self._running or not self.ec_needed:
+            return True
+        if self._mic_demand == self._aec_links_active:
+            return True
+
+        source = self._base_mic_node
+        reference = SPEAKER_SINK_NAME if self.spk_enabled else self._physical_sink
+        pairs = [
+            (f"{source}:capture_FL", "clearvoice_ec_capture:input_FL"),
+            (f"{source}:capture_FR", "clearvoice_ec_capture:input_FR"),
+        ]
+        if self.aec_enabled:
+            pairs.extend(
+                [
+                    (f"{reference}:monitor_FL", "clearvoice_ec_sink:input_FL"),
+                    (f"{reference}:monitor_FR", "clearvoice_ec_sink:input_FR"),
+                ]
+            )
+
+        if self._mic_demand:
+            connected = []
+            for output_port, input_port in pairs:
+                if not pw_link_ports(output_port, input_port, True):
+                    for linked_output, linked_input in connected:
+                        pw_link_ports(linked_output, linked_input, False)
+                    return False
+                connected.append((output_port, input_port))
+        else:
+            for output_port, input_port in pairs:
+                pw_link_ports(output_port, input_port, False)
+
+        self._aec_links_active = self._mic_demand
+        log.info("Mic DSP demand %s", "active" if self._mic_demand else "standby")
         return True
 
     # ── Start / Stop ──
@@ -1169,6 +1459,8 @@ class PipelineManager:
 
         needs_mic = self.nc_enabled or self.ec_needed
         source = None
+        bf_geometry = ""
+        private_aec_plugin = None
 
         if needs_mic:
             plugin_path = find_ladspa_plugin(DEEPFILTER_SO)
@@ -1178,6 +1470,39 @@ class PipelineManager:
             source = self._resolve_source()
             if not source:
                 return False, "No audio source device found"
+
+        if self.bf_enabled:
+            private_aec_plugin = _private_aec_plugin_path()
+            if private_aec_plugin is None:
+                return self._fail_start(
+                    f"Private beamformer plugin not found: {PRIVATE_AEC_PLUGIN}"
+                )
+            compiled, linked = pw_pipewire_versions()
+            if (compiled, linked) != (
+                REQUIRED_PIPEWIRE_VERSION,
+                REQUIRED_PIPEWIRE_VERSION,
+            ):
+                return self._fail_start(
+                    "Beamforming requires PipeWire compiled and linked with "
+                    f"{REQUIRED_PIPEWIRE_VERSION} (got {compiled or 'unknown'}/"
+                    f"{linked or 'unknown'})"
+                )
+            try:
+                custom = self.config["beamforming"].get("custom_geometry")
+                geometry = custom or MIC_PRESETS.get(
+                    self.config["beamforming"].get(
+                        "preset", "laptop-dual-50mm"
+                    ),
+                    {},
+                ).get("geometry", "")
+                serialize_mic_geometry(geometry)
+                bf_geometry = geometry
+            except ValueError as exc:
+                return self._fail_start(f"Invalid beamforming geometry: {exc}")
+            if not pw_source_has_separate_fl_fr(source):
+                return self._fail_start(
+                    "Beamforming requires separate FL and FR output ports on the selected source"
+                )
 
         log.info(
             "Starting pipeline — source=%s mic=%s spk=%s hp=%s",
@@ -1224,22 +1549,11 @@ class PipelineManager:
                     ec_out_name = VIRTUAL_MIC_NAME
                     ec_out_desc = VIRTUAL_MIC_DESC
 
-                geometry = ""
-                if self.bf_enabled:
-                    custom = self.config["beamforming"].get("custom_geometry")
-                    if custom:
-                        geometry = custom
-                    else:
-                        preset = self.config["beamforming"].get(
-                            "preset", "laptop-dual-60mm"
-                        )
-                        geometry = MIC_PRESETS.get(preset, {}).get("geometry", "")
-
                 conf = _pw_conf_echo_cancel(
                     target_source=source,
                     monitor_mode=self.aec_enabled,
                     beamforming=self.bf_enabled,
-                    mic_geometry=geometry,
+                    mic_geometry=bf_geometry,
                     source_name=ec_out_name,
                     source_desc=ec_out_desc,
                     is_intermediate=self.nc_enabled,
@@ -1253,9 +1567,22 @@ class PipelineManager:
                     ["pipewire", "-c", str(conf_path)],
                     stdout=subprocess.DEVNULL,
                     stderr=ec_log,
+                    env=self._echo_child_env(self.bf_enabled),
                 )
 
-                if not pw_wait_for_node(ec_out_name, timeout=6.0):
+                if self.bf_enabled:
+                    beamformer_ready, reason = pw_wait_for_beamformed_source(
+                        ec_out_name, self._ec_proc.pid, timeout=6.0
+                    )
+                    if not beamformer_ready:
+                        return self._fail_start(f"Beamformer verification failed: {reason}")
+                    if not pw_private_aec_plugin_loaded(
+                        self._ec_proc.pid, private_aec_plugin
+                    ):
+                        return self._fail_start(
+                            "Beamformer verification failed: private AEC plugin is not mapped"
+                        )
+                elif not pw_wait_for_node(ec_out_name, timeout=6.0):
                     ec_log.flush()
                     stderr = (RUNTIME_DIR / "echo-cancel.log").read_text()[-500:]
                     return self._fail_start(f"Echo-cancel failed to start: {stderr}")
@@ -1482,6 +1809,9 @@ class ClearVoiceTray:
                 ok, msg = self.pipeline.start()
                 if not ok:
                     log.error("Failed to start pipeline on launch: %s", msg)
+                    GLib.idle_add(self._show_error, msg)
+                elif self._pw_monitor:
+                    self.pipeline.set_mic_demand(self._pw_monitor.nodes_active)
                 GLib.idle_add(self._update_icon)
                 GLib.idle_add(self._update_status)
 
@@ -1568,7 +1898,7 @@ class ClearVoiceTray:
         mi_geo.set_submenu(sub_geo)
         m.append(mi_geo)
 
-        cur_preset = self.config["beamforming"].get("preset", "laptop-dual-60mm")
+        cur_preset = self.config["beamforming"].get("preset", "laptop-dual-50mm")
         grp2 = []
         for key, preset in MIC_PRESETS.items():
             ri = Gtk.RadioMenuItem(
@@ -1882,7 +2212,7 @@ class ClearVoiceTray:
         lbl = Gtk.Label(
             label=(
                 "Mic coordinates in meters, comma-separated:\n"
-                "  x1,y1,z1,x2,y2,z2,...\n\n"
+                "  x1,y1,z1,x2,y2,z2\n\n"
                 "Example (2 mics, 60mm apart):\n"
                 "  -0.03,0,0,0.03,0,0"
             )
@@ -1901,11 +2231,8 @@ class ClearVoiceTray:
         if dialog.run() == Gtk.ResponseType.OK:
             text = entry.get_text().strip()
             if text:
-                # Validate: must be comma-separated floats, count divisible by 3
                 try:
-                    vals = [float(v) for v in text.split(",")]
-                    if len(vals) < 3 or len(vals) % 3 != 0:
-                        raise ValueError("Need 3 coords per mic (x,y,z)")
+                    serialize_mic_geometry(text)
                 except ValueError as exc:
                     self._show_error(f"Invalid geometry: {exc}")
                     dialog.destroy()
@@ -2043,7 +2370,9 @@ class ClearVoiceTray:
             self._mi_status.set_label("Off")
 
     def _on_pw_state_change(self, nodes_active: bool):
-        """Called by PipeWireMonitor when node state changes (GTK thread)."""
+        """Called when an external app starts or stops consuming the mic."""
+        if not self.pipeline.set_mic_demand(nodes_active):
+            log.error("Could not update mic DSP demand links")
         self._update_icon(nodes_active=nodes_active)
         self._update_status(nodes_active=nodes_active)
 
