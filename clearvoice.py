@@ -58,6 +58,7 @@ PRIVATE_SPA_ROOT = Path.home() / ".local/lib/clearvoice/spa-0.2"
 PRIVATE_AEC_PLUGIN = PRIVATE_SPA_ROOT / "aec/libspa-aec-webrtc.so"
 SYSTEM_SPA_ROOT = Path("/usr/lib/spa-0.2")
 REQUIRED_PIPEWIRE_VERSION = "1.6.8"
+DEEPFILTER_RT_PRIORITY = 10
 
 # PipeWire node names
 VIRTUAL_MIC_NAME = "clearvoice_source"
@@ -80,6 +81,7 @@ LADSPA_SEARCH_PATHS = [
 # Speaker enhancement config (ships with the project)
 SPEAKER_CHAIN_CONF = Path(__file__).parent / "speaker-chain.conf"
 SPEAKER_SINK_NAME = "clearvoice_speakers"
+ORPHAN_PROCESS_PATTERN = r"^pipewire -c .*/clearvoice/"
 
 # Icons (3 states)
 ICON_ACTIVE = "audio-input-microphone-high"  # full bars — processing audio
@@ -213,7 +215,7 @@ def find_ladspa_plugin(filename: str) -> str | None:
 def check_dependencies() -> list[str]:
     """Return list of missing dependencies."""
     missing = []
-    for cmd in ("pipewire", "pw-dump", "pactl", "wpctl"):
+    for cmd in ("pipewire", "pw-dump", "pactl", "wpctl", "busctl"):
         if not shutil.which(cmd):
             missing.append(cmd)
     if not find_ladspa_plugin(DEEPFILTER_SO):
@@ -224,7 +226,7 @@ def check_dependencies() -> list[str]:
 # ── PipeWire Helpers ──────────────────────────────────────────────────────────
 
 
-def pw_dump_objects(manager: bool = False) -> list[dict]:
+def pw_dump_objects(manager: bool = False) -> list[dict] | None:
     """Return PipeWire objects, optionally through WirePlumber's manager remote."""
     try:
         result = subprocess.run(
@@ -239,12 +241,12 @@ def pw_dump_objects(manager: bool = False) -> list[dict]:
             ),
         )
         if result.returncode != 0:
-            return []
+            return None
         objects = json.loads(result.stdout)
-        return objects if isinstance(objects, list) else []
+        return objects if isinstance(objects, list) else None
     except Exception as exc:
         log.error("Failed to query PipeWire objects: %s", exc)
-        return []
+        return None
 
 
 def _pw_output_ports(objects: list[dict], node_id: int) -> list[dict]:
@@ -264,6 +266,8 @@ def _pw_output_ports(objects: list[dict], node_id: int) -> list[dict]:
 def pw_source_has_separate_fl_fr(source_name: str) -> bool:
     """Return whether a manager-visible source exposes individual FL and FR ports."""
     objects = pw_dump_objects(manager=True)
+    if objects is None:
+        return False
     nodes = [
         obj
         for obj in objects
@@ -350,6 +354,9 @@ def pw_wait_for_beamformed_source(
     reason = "beamformer source did not appear"
     while time.monotonic() < deadline:
         objects = pw_dump_objects(manager=True)
+        if objects is None:
+            time.sleep(0.1)
+            continue
         clients = [
             obj
             for obj in objects
@@ -634,8 +641,9 @@ class PipeWireMonitor:
     appears or disappears. Zero CPU when nothing changes.
     """
 
-    def __init__(self, on_state_change: callable):
+    def __init__(self, on_state_change: callable, on_link_removed=None):
         self.on_state_change = on_state_change
+        self.on_link_removed = on_link_removed
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._active = False
@@ -717,6 +725,14 @@ class PipeWireMonitor:
             if not isinstance(object_id, int):
                 continue
             if obj.get("type") is None or obj.get("info") is None:
+                previous = self._objects.get(object_id)
+                if (
+                    self._active
+                    and self.on_link_removed
+                    and previous
+                    and previous.get("type") == "PipeWire:Interface:Link"
+                ):
+                    self.on_link_removed()
                 self._objects.pop(object_id, None)
             else:
                 self._objects[object_id] = obj
@@ -774,17 +790,267 @@ def pw_link_ports(output_port: str, input_port: str, connect: bool) -> bool:
             timeout=3,
             env={**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"},
         )
-        if result.returncode != 0 and connect:
+        if result.returncode != 0:
             log.warning(
-                "Could not link %s to %s: %s",
+                "Could not %s link %s to %s: %s",
+                "connect" if connect else "disconnect",
                 output_port,
                 input_port,
                 result.stderr.strip(),
             )
-        return result.returncode == 0 or not connect
+        return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("Could not update PipeWire link: %s", exc)
         return False
+
+
+def _pw_link_present(
+    objects: list[dict], output_endpoint: str, input_endpoint: str
+) -> bool | None:
+    """Check exact node/port names in a successful snapshot."""
+    nodes = {}
+    for obj in objects:
+        if isinstance(obj, dict) and obj.get("type") == "PipeWire:Interface:Node":
+            props = (obj.get("info") or {}).get("props") or {}
+            nodes.setdefault(props.get("node.name"), []).append(str(obj.get("id")))
+    ports = {}
+    for obj in objects:
+        if not isinstance(obj, dict) or obj.get("type") != "PipeWire:Interface:Port":
+            continue
+        info = obj.get("info") or {}
+        props = info.get("props") or {}
+        node_id = str(props.get("node.id"))
+        port_name = props.get("port.name")
+        direction = props.get("port.direction", info.get("direction"))
+        if port_name:
+            ports.setdefault((node_id, port_name, direction), []).append(
+                str(obj.get("id"))
+            )
+
+    def resolve(endpoint: str, direction: tuple[str, ...]) -> str | None:
+        try:
+            node_name, port_name = endpoint.rsplit(":", 1)
+        except ValueError:
+            return None
+        node_ids = nodes.get(node_name, ())
+        if len(node_ids) != 1:
+            return None
+        matches = [
+            port_id
+            for port_direction in direction
+            for port_id in ports.get((node_ids[0], port_name, port_direction), ())
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    output_id = resolve(output_endpoint, ("out", "output"))
+    input_id = resolve(input_endpoint, ("in", "input"))
+    if output_id is None or input_id is None:
+        return None
+    return any(
+        obj.get("type") == "PipeWire:Interface:Link"
+        and str((obj.get("info") or {}).get("output-port-id")) == output_id
+        and str((obj.get("info") or {}).get("input-port-id")) == input_id
+        for obj in objects
+        if isinstance(obj, dict)
+    )
+
+
+def _deepfilter_thread(pid: int, timeout: float = 2.0) -> tuple[int | None, str]:
+    """Identify the one non-graph PipeWire worker from the plugin's known layout."""
+    try:
+        result = subprocess.run(
+            ["ps", "-L", "-p", str(pid), "-o", "tid=,comm=,cls="],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    if result.returncode != 0:
+        return None, result.stderr.strip() or "could not inspect process threads"
+
+    candidates = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        tid, comm, scheduling_class = fields
+        try:
+            thread_id = int(tid)
+        except ValueError:
+            continue
+        if thread_id == pid or comm == "module-rt" or comm.startswith("data-loop"):
+            continue
+        candidates.append((thread_id, comm, scheduling_class))
+    if not candidates:
+        return None, "inference worker has not appeared"
+    if (
+        len(candidates) != 1
+        or candidates[0][1] != "pipewire"
+        or candidates[0][2] not in ("TS", "RR")
+    ):
+        return None, "ambiguous PipeWire thread layout: " + ", ".join(
+            f"{tid}:{comm}/{scheduling_class}"
+            for tid, comm, scheduling_class in candidates
+        )
+    return candidates[0][0], ""
+
+
+def _deepfilter_worker_runtime_ns(pid: int, worker: int) -> int | None:
+    try:
+        return int(Path(f"/proc/{pid}/task/{worker}/schedstat").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def promote_deepfilter_worker(
+    pid: int, timeout: float = 10.0, should_cancel=None
+) -> int | None:
+    """Promote the caught-up DeepFilter worker below PipeWire's graph priority."""
+    deadline = time.monotonic() + timeout
+    reason = "inference worker has not appeared"
+    worker_busy = False
+    while time.monotonic() < deadline:
+        if should_cancel and should_cancel():
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        worker, reason = _deepfilter_thread(pid, timeout=min(2, remaining))
+        if worker is not None:
+            try:
+                # RTKit sets SCHED_RESET_ON_FORK alongside the policy; ignore that flag.
+                policy = os.sched_getscheduler(worker) & ~os.SCHED_RESET_ON_FORK
+                priority = os.sched_getparam(worker).sched_priority
+            except OSError:
+                time.sleep(0.01)
+                continue
+            if should_cancel and should_cancel():
+                return None
+            if policy == os.SCHED_RR:
+                if priority == DEEPFILTER_RT_PRIORITY:
+                    log.debug(
+                        "DeepFilter worker %d already uses SCHED_RR %d",
+                        worker,
+                        priority,
+                    )
+                    return worker
+                log.warning(
+                    "DeepFilter worker %d has unexpected SCHED_RR priority %d",
+                    worker,
+                    priority,
+                )
+                return None
+            if policy != os.SCHED_OTHER:
+                log.warning(
+                    "DeepFilter worker %d has unexpected scheduling policy %d",
+                    worker,
+                    policy,
+                )
+                return None
+            # Backlog draining can exhaust PipeWire's RLIMIT_RTTIME before promotion.
+            reason = "worker did not become idle before promotion timeout"
+            runtime_before = _deepfilter_worker_runtime_ns(pid, worker)
+            if runtime_before is None:
+                log.debug(
+                    "Skipping DeepFilter promotion: schedstat unreadable for worker %d",
+                    worker,
+                )
+                return None
+            sample_started = time.monotonic()
+            if deadline - sample_started < 0.25:
+                break
+            time.sleep(0.25)
+            if should_cancel and should_cancel():
+                return None
+            runtime_after = _deepfilter_worker_runtime_ns(pid, worker)
+            sample_ns = int((time.monotonic() - sample_started) * 1_000_000_000)
+            if runtime_after is None or sample_ns <= 0 or runtime_after < runtime_before:
+                log.debug(
+                    "Skipping DeepFilter promotion: invalid schedstat sample for worker %d",
+                    worker,
+                )
+                return None
+            if (runtime_after - runtime_before) * 2 >= sample_ns:
+                worker_busy = True
+                reason = "worker remained busy draining its startup backlog"
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                result = subprocess.run(
+                    [
+                        "busctl",
+                        "call",
+                        "org.freedesktop.RealtimeKit1",
+                        "/org/freedesktop/RealtimeKit1",
+                        "org.freedesktop.RealtimeKit1",
+                        "MakeThreadRealtimeWithPID",
+                        "ttu",
+                        str(pid),
+                        str(worker),
+                        str(DEEPFILTER_RT_PRIORITY),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=min(3, remaining / 2),
+                )
+                if result.returncode == 0:
+                    if should_cancel and should_cancel():
+                        return None
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        log.warning(
+                            "DeepFilter worker promotion could not be verified before timeout"
+                        )
+                        return None
+                    verified, reason = _deepfilter_thread(
+                        pid, timeout=min(2, remaining)
+                    )
+                    try:
+                        verified_policy = (
+                            os.sched_getscheduler(verified) & ~os.SCHED_RESET_ON_FORK
+                        )
+                        verified_priority = os.sched_getparam(verified).sched_priority
+                    except (OSError, TypeError):
+                        verified_policy = verified_priority = None
+                    if (
+                        verified == worker
+                        and verified_policy == os.SCHED_RR
+                        and verified_priority == DEEPFILTER_RT_PRIORITY
+                    ):
+                        log.info(
+                            "Promoted DeepFilter worker %d to SCHED_RR %d",
+                            worker,
+                            DEEPFILTER_RT_PRIORITY,
+                        )
+                        return worker
+                    log.warning(
+                        "DeepFilter worker promotion could not be verified: %s",
+                        reason
+                        or f"tid={verified}, policy={verified_policy}, "
+                        f"priority={verified_priority}",
+                    )
+                    return None
+                log.warning("RTKit rejected DeepFilter worker: %s", result.stderr.strip())
+                return None
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                log.warning("Could not promote DeepFilter worker: %s", exc)
+                return None
+        elif reason.startswith("ambiguous"):
+            log.warning("Skipping DeepFilter promotion: %s", reason)
+            return None
+        time.sleep(0.01)
+    if not should_cancel or not should_cancel():
+        if worker_busy:
+            log.warning("Skipping DeepFilter promotion: %s", reason)
+        else:
+            log.warning(
+                "DeepFilter worker thread did not appear for RTKit promotion: %s",
+                reason,
+            )
+    return None
 
 
 def pw_set_default_source(name: str) -> bool:
@@ -929,8 +1195,9 @@ def _pw_conf_filter_chain(
         "}\n"
         "\n"
         "context.modules = [\n"
+        "    # ponytail: diagnostic 150ms soft limit sends SIGXCPU before unchanged 200ms hard SIGKILL.\n"
         "    { name = libpipewire-module-rt\n"
-        "        args = { nice.level = -11 }\n"
+        "        args = { nice.level = -11 rt.time.soft = 150000 rt.time.hard = 200000 }\n"
         "        flags = [ ifexists nofail ]\n"
         "    }\n"
         "    { name = libpipewire-module-protocol-native }\n"
@@ -1061,8 +1328,9 @@ def _pw_conf_echo_cancel(
         "}\n"
         "\n"
         "context.modules = [\n"
+        "    # ponytail: diagnostic 150ms soft limit sends SIGXCPU before unchanged 200ms hard SIGKILL.\n"
         "    { name = libpipewire-module-rt\n"
-        "        args = { nice.level = -11 }\n"
+        "        args = { nice.level = -11 rt.time.soft = 150000 rt.time.hard = 200000 }\n"
         "        flags = [ ifexists nofail ]\n"
         "    }\n"
         "    { name = libpipewire-module-protocol-native }\n"
@@ -1120,12 +1388,19 @@ class PipelineManager:
         self._running = False
         self._transitioning = False  # True during stop/start — suppresses health checks
         self._lock = threading.Lock()
+        self._demand_lock = threading.Lock()
         self._base_mic_node: str | None = None
         self._physical_sink: str | None = None
+        self._playback_sink: str | None = None
         self._headphone_mode = False
         self._route_confirmed = False
         self._mic_demand = False
-        self._aec_links_active = False
+        self._demand_revision = 0
+        self._reconcile_requested = False
+        self._reconcile_running = False
+        self._reconcile_thread: threading.Thread | None = None
+        self._generation = 0
+        self._shutdown_requested = False
 
         # Ensure child processes are cleaned up if we crash
         atexit.register(self._kill_all)
@@ -1321,49 +1596,97 @@ class PipelineManager:
         if not default_set:
             log.warning("Could not set default playback sink to %s", sink_name)
             return False
+        self._playback_sink = sink_name
         if self._physical_sink:
             pw_move_playback_streams(self._physical_sink, sink_name)
         return gain_set
 
+    def _set_physical_playback(self, sink_name: str, gain_percent: int):
+        self._set_playback_sink(sink_name, gain_percent)
+        if self._playback_sink != sink_name:
+            log.error("Could not select physical playback sink %s; AEC reference unavailable", sink_name)
+
+    def _stop_failed_speaker_chain(self):
+        proc = self._spk_proc
+        self._spk_proc = None
+        if proc is None or proc.poll() is not None:
+            return
+        pid = getattr(proc, "pid", "unknown")
+        log.warning("Stopping failed speaker-chain process (pid %s)", pid)
+        try:
+            proc.terminate()
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "Failed speaker-chain SIGTERM timed out (pid %s); escalating to SIGKILL",
+                pid,
+            )
+            try:
+                proc.kill()
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                log.error("Failed speaker-chain process (pid %s) survived SIGKILL", pid)
+        except OSError as exc:
+            log.warning("Could not stop failed speaker-chain process (pid %s): %s", pid, exc)
+
     def _start_playback_output(self):
         """Activate the appropriate speaker or headphone playback route."""
+        self._playback_sink = None
         physical_sink = self._physical_sink
         if not physical_sink:
             log.warning("No physical playback sink found; leaving playback route unchanged")
             return
         if self._headphone_mode:
-            self._set_playback_sink(
+            self._set_physical_playback(
                 physical_sink, self.config["headphone_gain_percent"]
             )
             return
         if not self.spk_enabled or not SPEAKER_CHAIN_CONF.is_file():
             if not self.spk_enabled:
-                self._set_playback_sink(
+                self._set_physical_playback(
                     physical_sink, self.config["speaker_gain_percent"]
                 )
             else:
                 log.warning("Speaker chain config not found; using physical speakers")
-                self._set_playback_sink(
+                self._set_physical_playback(
                     physical_sink, self.config["speaker_gain_percent"]
                 )
             return
 
         pw_set_node_volume(physical_sink, 100)
         log.info("Spawning speaker-chain process")
-        spk_log = open(RUNTIME_DIR / "speaker-chain.log", "w")
-        self._spk_proc = subprocess.Popen(
-            ["pipewire", "-c", str(SPEAKER_CHAIN_CONF)],
-            stdout=subprocess.DEVNULL,
-            stderr=spk_log,
-        )
+        try:
+            with open(RUNTIME_DIR / "speaker-chain.log", "a") as spk_log:
+                spk_log.write(
+                    f"\n--- speaker-chain start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+                )
+                spk_log.flush()
+                self._spk_proc = self._spawn_child(
+                    ["pipewire", "-c", str(SPEAKER_CHAIN_CONF)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=spk_log,
+                )
+        except OSError as exc:
+            log.warning("Could not spawn speaker-chain; using physical speakers: %s", exc)
+            self._set_physical_playback(physical_sink, self.config["speaker_gain_percent"])
+            return
+        if self._spk_proc is None:
+            return
+        if self._shutdown_pending():
+            self._stop_failed_speaker_chain()
+            return
         if pw_wait_for_node(SPEAKER_SINK_NAME, timeout=6.0):
             self._set_playback_sink(
                 SPEAKER_SINK_NAME, self.config["speaker_gain_percent"]
             )
-            log.info("Speaker chain ready: %s", SPEAKER_SINK_NAME)
-            return
-        log.warning("Speaker chain failed to start; using physical speakers")
-        self._set_playback_sink(physical_sink, self.config["speaker_gain_percent"])
+            if self._playback_sink == SPEAKER_SINK_NAME:
+                log.info("Speaker chain ready: %s", SPEAKER_SINK_NAME)
+                return
+            log.warning("Could not select speaker-chain sink; falling back to physical speakers")
+        else:
+            log.warning("Speaker chain failed to start; using physical speakers")
+        self._stop_failed_speaker_chain()
+        self._set_physical_playback(physical_sink, self.config["speaker_gain_percent"])
 
     @staticmethod
     def _echo_child_env(beamforming: bool) -> dict[str, str]:
@@ -1381,59 +1704,292 @@ class PipelineManager:
         return True
 
     def set_mic_demand(self, active: bool) -> bool:
-        """Connect AEC inputs only while an external app consumes the mic."""
-        self._mic_demand = bool(active)
-        if not self._running or not self.ec_needed:
-            return True
-        if self._mic_demand == self._aec_links_active:
-            return True
+        """Publish the latest mic intent and queue off-GTK graph reconciliation."""
+        active = bool(active)
+        with self._demand_lock:
+            if self._shutdown_requested:
+                return False
+            if active != self._mic_demand:
+                self._demand_revision += 1
+                self._mic_demand = active
+                log.info("Mic DSP demand %s", "active" if active else "standby")
+        self._request_mic_reconcile()
+        return True
 
+    def request_shutdown(self):
+        """Cancel pending startup/reconciliation before asynchronous cleanup."""
+        with self._demand_lock:
+            if self._shutdown_requested:
+                return
+            self._shutdown_requested = True
+            self._reconcile_requested = False
+            if self._mic_demand:
+                self._demand_revision += 1
+                self._mic_demand = False
+
+    def _shutdown_pending(self) -> bool:
+        with self._demand_lock:
+            return self._shutdown_requested
+
+    def _spawn_child(self, command, **kwargs):
+        with self._demand_lock:
+            if self._shutdown_requested:
+                return None
+            return subprocess.Popen(command, **kwargs)
+
+    def _request_mic_reconcile(self):
+        with self._demand_lock:
+            if self._shutdown_requested:
+                return
+            self._reconcile_requested = True
+            if self._reconcile_running:
+                return
+            self._reconcile_running = True
+            self._reconcile_thread = threading.Thread(
+                target=self._mic_reconcile_loop,
+                name="clearvoice-mic-reconcile",
+                daemon=True,
+            )
+            thread = self._reconcile_thread
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._demand_lock:
+                self._reconcile_running = False
+            log.exception("Could not start mic demand reconciler")
+
+    def _mic_reconcile_loop(self):
+        while True:
+            with self._demand_lock:
+                if self._shutdown_requested or not self._reconcile_requested:
+                    self._reconcile_running = False
+                    return
+                self._reconcile_requested = False
+                active = self._mic_demand
+                revision = self._demand_revision
+            try:
+                with self._lock:
+                    generation = self._generation
+                    if (
+                        self._running
+                        and not self._transitioning
+                        and not self._shutdown_requested
+                    ):
+                        self._reconcile_mic_demand(active, revision, generation)
+            except Exception:
+                log.exception("Mic demand reconciliation failed")
+            with self._demand_lock:
+                if revision != self._demand_revision:
+                    self._reconcile_requested = True
+                if self._reconcile_requested:
+                    continue
+                self._reconcile_running = False
+                return
+
+    def _demand_is_current(
+        self, active: bool, revision: int, generation: int, proc=None
+    ) -> bool:
+        with self._demand_lock:
+            if (
+                self._shutdown_requested
+                or self._mic_demand != active
+                or self._demand_revision != revision
+            ):
+                return False
+        return (
+            self._generation == generation
+            and self._running
+            and not self._transitioning
+            and (proc is None or (self._fc_proc is proc and proc.poll() is None))
+        )
+
+    def _aec_link_pairs(self) -> list[tuple[str, str]]:
+        if not self.ec_needed or not self._base_mic_node:
+            return []
         source = self._base_mic_node
-        reference = SPEAKER_SINK_NAME if self.spk_enabled else self._physical_sink
         pairs = [
             (f"{source}:capture_FL", "clearvoice_ec_capture:input_FL"),
             (f"{source}:capture_FR", "clearvoice_ec_capture:input_FR"),
         ]
         if self.aec_enabled:
-            pairs.extend(
-                [
-                    (f"{reference}:monitor_FL", "clearvoice_ec_sink:input_FL"),
-                    (f"{reference}:monitor_FR", "clearvoice_ec_sink:input_FR"),
-                ]
+            reference = self._playback_sink
+            if reference:
+                pairs.extend(
+                    [
+                        (f"{reference}:monitor_FL", "clearvoice_ec_sink:input_FL"),
+                        (f"{reference}:monitor_FR", "clearvoice_ec_sink:input_FR"),
+                    ]
+                )
+            else:
+                log.warning("AEC reference unavailable: no playback sink was selected")
+        return pairs
+
+    def _filter_capture_pairs(self, objects: list[dict]) -> list[tuple[str, str]]:
+        if not self.nc_enabled or not self._base_mic_node:
+            return []
+        source = EC_SOURCE_NAME if self.ec_needed else self._base_mic_node
+        target = "clearvoice_capture"
+
+        def channels(node_name: str, direction: str, prefix: str):
+            nodes = [
+                str(obj.get("id"))
+                for obj in objects
+                if isinstance(obj, dict)
+                and obj.get("type") == "PipeWire:Interface:Node"
+                and ((obj.get("info") or {}).get("props") or {}).get("node.name")
+                == node_name
+            ]
+            if len(nodes) != 1:
+                return None
+            result = {}
+            for obj in objects:
+                if not isinstance(obj, dict) or obj.get("type") != "PipeWire:Interface:Port":
+                    continue
+                info = obj.get("info") or {}
+                props = info.get("props") or {}
+                name = props.get("port.name")
+                port_direction = props.get("port.direction", info.get("direction"))
+                if (
+                    str(props.get("node.id")) == nodes[0]
+                    and port_direction
+                    in (direction, "output" if direction == "out" else "input")
+                    and isinstance(name, str)
+                    and name.startswith(prefix)
+                ):
+                    channel = name.removeprefix(prefix)
+                    if channel not in ("MONO", "FL", "FR") or channel in result:
+                        return None
+                    result[channel] = name
+            return result or None
+
+        outputs = channels(source, "out", "capture_")
+        inputs = channels(target, "in", "input_")
+        if outputs is None or inputs is None:
+            log.warning(
+                "Could not identify unambiguous %s -> %s filter ports", source, target
             )
-
-        if self._mic_demand:
-            connected = []
-            for output_port, input_port in pairs:
-                if not pw_link_ports(output_port, input_port, True):
-                    for linked_output, linked_input in connected:
-                        pw_link_ports(linked_output, linked_input, False)
-                    return False
-                connected.append((output_port, input_port))
+            return []
+        output_channels, input_channels = set(outputs), set(inputs)
+        if output_channels == input_channels == {"MONO"}:
+            channels_to_link = (("MONO", "MONO"),)
+        elif (
+            input_channels == {"MONO"}
+            and "FL" in output_channels
+            and "MONO" not in output_channels
+        ):
+            channels_to_link = (("FL", "MONO"),)
+        elif output_channels == input_channels == {"FL", "FR"}:
+            channels_to_link = (("FL", "FL"), ("FR", "FR"))
         else:
-            for output_port, input_port in pairs:
-                pw_link_ports(output_port, input_port, False)
+            log.warning(
+                "Ambiguous capture channels for %s -> %s (outputs=%s inputs=%s)",
+                source,
+                target,
+                sorted(output_channels),
+                sorted(input_channels),
+            )
+            return []
+        return [
+            (
+                f"{source}:{outputs[output_channel]}",
+                f"{target}:{inputs[input_channel]}",
+            )
+            for output_channel, input_channel in channels_to_link
+        ]
 
-        self._aec_links_active = self._mic_demand
-        log.info("Mic DSP demand %s", "active" if self._mic_demand else "standby")
-        return True
+    def _reconcile_aec_links(
+        self, active: bool, revision: int, generation: int
+    ):
+        if not self._base_mic_node or (not self.ec_needed and not (active and self.nc_enabled)):
+            return
+        objects = pw_dump_objects(manager=True)
+        if objects is None:
+            log.warning("Could not inspect PipeWire links; retrying on next health check")
+            return
+        pairs = self._aec_link_pairs()
+        if active:
+            pairs.extend(self._filter_capture_pairs(objects))
+        missing = []
+        for pair in pairs:
+            present = _pw_link_present(objects, *pair)
+            if present is None:
+                log.warning(
+                    "Could not unambiguously inspect PipeWire link %s -> %s", *pair
+                )
+            elif active and not present:
+                missing.append(pair)
+            elif not active and present:
+                if not self._demand_is_current(False, revision, generation):
+                    return
+                pw_link_ports(*pair, connect=False)
+
+        if not active:
+            return
+
+        added = []
+
+        def rollback_added():
+            if self._generation == generation:
+                for output_port, input_port in added:
+                    pw_link_ports(output_port, input_port, False)
+
+        for output_port, input_port in missing:
+            if not self._demand_is_current(True, revision, generation):
+                rollback_added()
+                return
+            if not pw_link_ports(output_port, input_port, True):
+                rollback_added()
+                return
+            added.append((output_port, input_port))
+            if not self._demand_is_current(True, revision, generation):
+                rollback_added()
+                return
+
+    def _reconcile_deepfilter(
+        self, active: bool, revision: int, generation: int
+    ):
+        if not self._demand_is_current(active, revision, generation):
+            return
+        if not active or not self.nc_enabled:
+            return
+        proc = self._fc_proc
+        if not proc or proc.poll() is not None:
+            return
+
+        def should_cancel():
+            return not self._demand_is_current(True, revision, generation, proc)
+
+        promote_deepfilter_worker(proc.pid, should_cancel=should_cancel)
+
+    def _reconcile_mic_demand(self, active: bool, revision: int, generation: int):
+        self._reconcile_aec_links(active, revision, generation)
+        self._reconcile_deepfilter(active, revision, generation)
 
     # ── Start / Stop ──
 
     def start(self) -> tuple[bool, str]:
+        if self._shutdown_pending():
+            return False, "Pipeline shutdown requested"
         with self._lock:
+            if self._shutdown_pending():
+                return False, "Pipeline shutdown requested"
             try:
-                return self._start_locked()
+                result = self._start_locked()
             except Exception as exc:
                 log.exception("Pipeline start failed")
-                return self._fail_start(str(exc))
+                result = self._fail_start(str(exc))
+        if result[0]:
+            self._request_mic_reconcile()
+        return result
 
     @staticmethod
     def _cleanup_orphans():
         """Kill any orphaned ClearVoice PipeWire processes from a previous crash."""
         try:
             result = subprocess.run(
-                ["pgrep", "-f", "pipewire -c.*/clearvoice/"],
+                # Anchored: only our own `pipewire -c` children, never shells/editors
+                # whose command line merely mentions these paths.
+                ["pgrep", "-u", str(os.getuid()), "-f", ORPHAN_PROCESS_PATTERN],
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -1453,11 +2009,15 @@ class PipelineManager:
             pass
 
     def _start_locked(self) -> tuple[bool, str]:
+        if self._shutdown_pending():
+            return False, "Pipeline shutdown requested"
         if self._running:
             return True, "Already running"
 
+        self._generation += 1
         self._running = False
         self._base_mic_node = None
+        self._playback_sink = None
         self._physical_sink = self._resolve_physical_sink()
         self._refresh_headphone_mode()
 
@@ -1538,6 +2098,8 @@ class PipelineManager:
 
         # Make the eventual AEC monitor use the selected playback route.
         self._start_playback_output()
+        if self._shutdown_pending():
+            return self._fail_start("Pipeline shutdown requested")
 
         if needs_mic:
             self._base_mic_node = source
@@ -1551,7 +2113,7 @@ class PipelineManager:
                 return self._fail_start("Could not prepare base mic audio lock")
 
         # Which node becomes the system default virtual mic?
-        final_node = VIRTUAL_MIC_NAME if self.nc_enabled else VIRTUAL_MIC_NAME
+        final_node = VIRTUAL_MIC_NAME
 
         try:
             # ── Stage 1: Echo-cancel (beamforming / AEC) ──
@@ -1577,13 +2139,22 @@ class PipelineManager:
                 conf_path.write_text(conf)
 
                 log.info("Spawning echo-cancel process")
-                ec_log = open(RUNTIME_DIR / "echo-cancel.log", "w")
-                self._ec_proc = subprocess.Popen(
-                    ["pipewire", "-c", str(conf_path)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=ec_log,
-                    env=self._echo_child_env(self.bf_enabled),
-                )
+                with open(RUNTIME_DIR / "echo-cancel.log", "a") as ec_log:
+                    ec_log.write(
+                        "\n--- echo-cancel start "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+                    )
+                    ec_log.flush()
+                    self._ec_proc = self._spawn_child(
+                        ["pipewire", "-c", str(conf_path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=ec_log,
+                        env=self._echo_child_env(self.bf_enabled),
+                    )
+                if self._ec_proc is None:
+                    return self._fail_start("Pipeline shutdown requested")
+                if self._shutdown_pending():
+                    return self._fail_start("Pipeline shutdown requested")
 
                 if self.bf_enabled:
                     beamformer_ready, reason = pw_wait_for_beamformed_source(
@@ -1598,8 +2169,7 @@ class PipelineManager:
                             "Beamformer verification failed: private AEC plugin is not mapped"
                         )
                 elif not pw_wait_for_node(ec_out_name, timeout=6.0):
-                    ec_log.flush()
-                    stderr = (RUNTIME_DIR / "echo-cancel.log").read_text()[-500:]
+                    stderr = self._read_recent_log("echo-cancel")
                     return self._fail_start(f"Echo-cancel failed to start: {stderr}")
 
                 log.info("Echo-cancel ready: %s", ec_out_name)
@@ -1624,16 +2194,24 @@ class PipelineManager:
                 conf_path.write_text(conf)
 
                 log.info("Spawning filter-chain process")
-                fc_log = open(RUNTIME_DIR / "filter-chain.log", "w")
-                self._fc_proc = subprocess.Popen(
-                    ["pipewire", "-c", str(conf_path)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=fc_log,
-                )
+                with open(RUNTIME_DIR / "filter-chain.log", "a") as fc_log:
+                    fc_log.write(
+                        "\n--- filter-chain start "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+                    )
+                    fc_log.flush()
+                    self._fc_proc = self._spawn_child(
+                        ["pipewire", "-c", str(conf_path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=fc_log,
+                    )
+                if self._fc_proc is None:
+                    return self._fail_start("Pipeline shutdown requested")
+                if self._shutdown_pending():
+                    return self._fail_start("Pipeline shutdown requested")
 
                 if not pw_wait_for_node(VIRTUAL_MIC_NAME, timeout=6.0):
-                    fc_log.flush()
-                    stderr = (RUNTIME_DIR / "filter-chain.log").read_text()[-500:]
+                    stderr = self._read_recent_log("filter-chain")
                     return self._fail_start(f"Filter-chain failed to start: {stderr}")
 
                 log.info("Filter-chain ready: %s", VIRTUAL_MIC_NAME)
@@ -1662,6 +2240,8 @@ class PipelineManager:
             if not self._publish_output_volume_lock(output_lock):
                 return self._fail_start("Could not publish ClearVoice volume lock")
 
+            if self._shutdown_pending():
+                return self._fail_start("Pipeline shutdown requested")
             self._running = True
             return True, "Pipeline active"
 
@@ -1677,6 +2257,7 @@ class PipelineManager:
         if not self._running:
             return True, "Already stopped"
 
+        self._generation += 1
         was_transitioning = self._transitioning
         self._transitioning = True
         log.info("Stopping pipeline")
@@ -1686,6 +2267,7 @@ class PipelineManager:
         self._kill_all()
         self._restore_previous_defaults()
         self._base_mic_node = None
+        self._playback_sink = None
         self._running = False
         if not was_transitioning:
             self._transitioning = False
@@ -1698,6 +2280,7 @@ class PipelineManager:
         self._kill_all()
         self._restore_previous_defaults()
         self._base_mic_node = None
+        self._playback_sink = None
         return False, msg
 
     def _restore_previous_defaults(self):
@@ -1713,17 +2296,28 @@ class PipelineManager:
                 pw_set_default_sink(sink_id)
 
     def restart(self) -> tuple[bool, str]:
+        if self._shutdown_pending():
+            return False, "Pipeline shutdown requested"
         with self._lock:
+            if self._shutdown_pending():
+                return False, "Pipeline shutdown requested"
             self._transitioning = True
             try:
                 self._stop_locked()
                 time.sleep(0.5)
-                return self._start_locked()
+                result = (
+                    (False, "Pipeline shutdown requested")
+                    if self._shutdown_pending()
+                    else self._start_locked()
+                )
             except Exception as exc:
                 log.exception("Pipeline restart failed")
-                return self._fail_start(str(exc))
+                result = self._fail_start(str(exc))
             finally:
                 self._transitioning = False
+        if result[0]:
+            self._request_mic_reconcile()
+        return result
 
     # ── Health ──
 
@@ -1731,28 +2325,47 @@ class PipelineManager:
         if not self._running or self._transitioning:
             return True
         dead = []
-        if self._fc_proc and self._fc_proc.poll() is not None:
-            dead.append(("filter-chain", self._fc_proc.returncode))
-        if self._ec_proc and self._ec_proc.poll() is not None:
-            dead.append(("echo-cancel", self._ec_proc.returncode))
-        if self._spk_proc and self._spk_proc.poll() is not None:
-            dead.append(("speaker-chain", self._spk_proc.returncode))
+        for attr, name in (
+            ("_fc_proc", "filter-chain"),
+            ("_ec_proc", "echo-cancel"),
+            ("_spk_proc", "speaker-chain"),
+        ):
+            proc = getattr(self, attr)
+            if proc:
+                returncode = proc.poll()
+                if returncode is not None:
+                    dead.append((name, proc.pid, returncode))
         if dead:
-            for name, rc in dead:
-                log.error("%s died (rc=%d)", name, rc)
+            for name, pid, rc in dead:
+                if rc < 0:
+                    try:
+                        status = f"signal {signal.Signals(-rc).name} ({-rc})"
+                    except ValueError:
+                        status = f"signal {-rc}"
+                else:
+                    status = f"exit code {rc}"
+                stderr = self._read_recent_log(name)
+                log.error(
+                    "%s died (pid=%d, %s); recent stderr: %r",
+                    name,
+                    pid,
+                    status,
+                    stderr,
+                )
             return False
         return True
 
     # ── Internals ──
 
     @staticmethod
-    def _read_stderr(proc: subprocess.Popen, limit: int = 500) -> str:
+    def _read_recent_log(name: str, limit: int = 500) -> str:
         try:
-            if proc.stderr and proc.poll() is not None:
-                return proc.stderr.read(limit).strip()
-        except Exception:
-            pass
-        return "(no output)"
+            with open(RUNTIME_DIR / f"{name}.log", "rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - limit))
+                return stream.read().decode(errors="replace").strip() or "(empty)"
+        except OSError:
+            return "(no stderr captured)"
 
     def _kill_all(self):
         # Send SIGTERM to all processes first (non-blocking)
@@ -1760,6 +2373,11 @@ class PipelineManager:
         for attr in ("_fc_proc", "_ec_proc", "_spk_proc"):
             proc: subprocess.Popen | None = getattr(self, attr)
             if proc is not None and proc.poll() is None:
+                log.info(
+                    "Sending intentional SIGTERM to %s (pid %s)",
+                    attr,
+                    getattr(proc, "pid", "unknown"),
+                )
                 proc.terminate()
                 procs.append((attr, proc))
             else:
@@ -1772,11 +2390,20 @@ class PipelineManager:
             try:
                 proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
+                log.warning(
+                    "Intentional SIGTERM timed out for %s (pid %s); escalating to SIGKILL",
+                    attr,
+                    getattr(proc, "pid", "unknown"),
+                )
                 proc.kill()
                 try:
                     proc.wait(timeout=0.5)
                 except subprocess.TimeoutExpired:
-                    log.warning("Process %s (pid %d) did not die", attr, proc.pid)
+                    log.warning(
+                        "Process %s (pid %s) did not die after intentional SIGKILL",
+                        attr,
+                        getattr(proc, "pid", "unknown"),
+                    )
             setattr(self, attr, None)
 
 
@@ -1792,7 +2419,12 @@ class ClearVoiceTray:
         self._pw_monitor: PipeWireMonitor | None = None
         self._route_probe_pending = False
         self._route_restart_pending = False
+        self._health_restart_pending = False
         self._quitting = False
+        self._enable_converge_lock = threading.Lock()
+        self._enable_converge_running = False
+        self._enable_replay_mic = False
+        self._enable_converge_thread: threading.Thread | None = None
 
         if HAS_APPINDICATOR:
             self.indicator = AppIndicator.Indicator.new(
@@ -1815,30 +2447,25 @@ class ClearVoiceTray:
         self._update_icon()
         self._update_status()
 
-        # Process health check (10s)
-        GLib.timeout_add_seconds(10, self._on_health_tick)
+        self._register_periodic_checks()
 
         # Jack-route probes run off the GTK thread.
         GLib.timeout_add_seconds(2, self._on_route_tick)
 
         # Event-driven node state monitor
-        self._pw_monitor = PipeWireMonitor(on_state_change=self._on_pw_state_change)
+        self._pw_monitor = PipeWireMonitor(
+            on_state_change=self._on_pw_state_change,
+            on_link_removed=self.pipeline._request_mic_reconcile,
+        )
         self._pw_monitor.start()
 
         # Start pipeline if enabled in config (off GTK thread)
         if self.config.get("enabled", True):
+            self._request_enabled_converge(replay_mic=True)
 
-            def _deferred_start():
-                ok, msg = self.pipeline.start()
-                if not ok:
-                    log.error("Failed to start pipeline on launch: %s", msg)
-                    GLib.idle_add(self._show_error, msg)
-                elif self._pw_monitor:
-                    self.pipeline.set_mic_demand(self._pw_monitor.nodes_active)
-                GLib.idle_add(self._update_icon)
-                GLib.idle_add(self._update_status)
-
-            threading.Thread(target=_deferred_start, daemon=True).start()
+    def _register_periodic_checks(self):
+        GLib.timeout_add_seconds(2, self._on_health_tick)
+        GLib.timeout_add_seconds(10, self._on_reconcile_tick)
 
     # ── Menu Construction ──
 
@@ -1981,25 +2608,98 @@ class ClearVoiceTray:
     # ── Callbacks ──
 
     def _on_enable(self, item):
+        if self._quitting:
+            return
         enabled = item.get_active()
-        self.config["enabled"] = enabled
+        with self._enable_converge_lock:
+            self.config["enabled"] = enabled
         save_config(self.config)
-        if enabled:
-
-            def _do():
-                ok, msg = self.pipeline.start()
-                GLib.idle_add(self._update_icon)
-                GLib.idle_add(self._update_status)
-                if not ok:
-                    GLib.idle_add(item.set_active, False)
-                    GLib.idle_add(self._show_error, msg)
-
-            threading.Thread(target=_do, daemon=True).start()
-        else:
+        if not enabled:
             self._route_restart_pending = False
-            self.pipeline.stop()
-            self._update_icon()
-            self._update_status()
+        self._request_enabled_converge()
+
+    def _request_enabled_converge(self, replay_mic: bool = False):
+        with self._enable_converge_lock:
+            if self._quitting:
+                return
+            self._enable_replay_mic |= replay_mic
+            if self._enable_converge_running:
+                return
+            self._enable_converge_running = True
+            self._enable_converge_thread = threading.Thread(
+                target=self._converge_enabled_state,
+                name="clearvoice-enable-converge",
+                daemon=True,
+            )
+            thread = self._enable_converge_thread
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._enable_converge_lock:
+                self._enable_converge_running = False
+            log.exception("Could not start enable-state reconciler")
+
+    def _converge_enabled_state(self):
+        while True:
+            with self._enable_converge_lock:
+                if self._quitting:
+                    self._enable_converge_running = False
+                    return
+                enabled = bool(self.config.get("enabled", True))
+
+            if self.pipeline.running != enabled:
+                try:
+                    ok, msg = (
+                        self.pipeline.start() if enabled else self.pipeline.stop()
+                    )
+                except Exception as exc:
+                    log.exception("Could not converge ClearVoice enable state")
+                    ok, msg = False, str(exc)
+                if not ok:
+                    with self._enable_converge_lock:
+                        latest = bool(self.config.get("enabled", True))
+                        if self._quitting:
+                            self._enable_converge_running = False
+                            return
+                        if latest != enabled or self.pipeline.running == latest:
+                            continue
+                        self._enable_converge_running = False
+                    GLib.idle_add(
+                        self._finish_enabled_converge, enabled, False, msg
+                    )
+                    return
+                continue
+
+            with self._enable_converge_lock:
+                if self._quitting:
+                    self._enable_converge_running = False
+                    return
+                if enabled and self._enable_replay_mic:
+                    self._enable_replay_mic = False
+                    if self._pw_monitor:
+                        self.pipeline.set_mic_demand(self._pw_monitor.nodes_active)
+                latest = bool(self.config.get("enabled", True))
+                if latest != self.pipeline.running or (
+                    latest and self._enable_replay_mic
+                ):
+                    continue
+                self._enable_converge_running = False
+            GLib.idle_add(self._finish_enabled_converge, latest, True, "")
+            return
+
+    def _finish_enabled_converge(self, enabled: bool, ok: bool, msg: str):
+        if self._quitting or bool(self.config.get("enabled", True)) != enabled:
+            return False
+        if ok and self.pipeline.running != enabled:
+            return False
+        self._update_icon()
+        self._update_status()
+        if not ok:
+            log.error("Could not %s ClearVoice", "enable" if enabled else "disable")
+            self._show_error(msg)
+            if enabled:
+                self._mi_enable.set_active(False)
+        return False
 
     def _on_source_menu_show(self, submenu):
         for child in submenu.get_children():
@@ -2323,13 +3023,32 @@ class ClearVoiceTray:
             self._async_restart()
 
     def _on_quit(self, _item):
+        self._begin_shutdown()
+
+    def _begin_shutdown(self):
+        if self._quitting:
+            return
         self._quitting = True
         self._route_restart_pending = False
-        if self._pw_monitor:
-            self._pw_monitor.stop()
-        self.pipeline.stop()
-        save_config(self.config)
-        Gtk.main_quit()
+        self.pipeline.request_shutdown()
+
+        def _do():
+            try:
+                if self._pw_monitor:
+                    self._pw_monitor.stop()
+            except Exception:
+                log.exception("Could not stop PipeWire monitor")
+            try:
+                self.pipeline.stop()
+            except Exception:
+                log.exception("Could not stop ClearVoice cleanly")
+            try:
+                save_config(self.config)
+            except Exception:
+                log.exception("Could not save ClearVoice configuration")
+            GLib.idle_add(Gtk.main_quit)
+
+        threading.Thread(target=_do, daemon=True).start()
 
     def _on_popup(self, icon, button, timestamp):
         self.menu.popup(
@@ -2338,23 +3057,41 @@ class ClearVoiceTray:
 
     # ── Helpers ──
 
-    def _async_restart(self, route_restart: bool = False):
+    def _async_restart(self, route_restart: bool = False, health_restart: bool = False):
         """Restart the pipeline off the GTK thread."""
+        if self._quitting or not self.config.get("enabled", True):
+            return
         if route_restart:
             if self._route_restart_pending:
                 return
             self._route_restart_pending = True
+        if health_restart:
+            # One child death must not queue a restart per 2 s liveness tick.
+            if self._health_restart_pending:
+                return
+            self._health_restart_pending = True
 
         def _do():
-            if route_restart and (self._quitting or not self.config.get("enabled", True)):
-                GLib.idle_add(self._finish_async_restart, None, None, True)
-                return
-            ok, msg = self.pipeline.restart()
-            GLib.idle_add(self._finish_async_restart, ok, msg, route_restart)
+            try:
+                if self._quitting or not self.config.get("enabled", True):
+                    return
+                ok, msg = self.pipeline.restart()
+                if self._quitting:
+                    return
+                if not self.config.get("enabled", True):
+                    # Disabled mid-restart: let the single converger own the final state.
+                    self._request_enabled_converge()
+                    return
+                GLib.idle_add(self._finish_async_restart, ok, msg, route_restart)
+            finally:
+                if health_restart:
+                    self._health_restart_pending = False
 
         threading.Thread(target=_do, daemon=True).start()
 
     def _finish_async_restart(self, ok: bool | None, msg: str | None, route_restart: bool):
+        if self._quitting:
+            return False
         if route_restart:
             self._route_restart_pending = False
         if ok is None:
@@ -2435,6 +3172,8 @@ class ClearVoiceTray:
 
     def _on_pw_state_change(self, nodes_active: bool):
         """Called when an external app starts or stops consuming the mic."""
+        if self._quitting:
+            return False
         if not self.pipeline.set_mic_demand(nodes_active):
             log.error("Could not update mic DSP demand links")
         self._update_icon(nodes_active=nodes_active)
@@ -2442,11 +3181,22 @@ class ClearVoiceTray:
 
     def _on_health_tick(self):
         """Process liveness check only — state is event-driven."""
+        if self._quitting:
+            return GLib.SOURCE_REMOVE
         if self.pipeline.running:
             if not self.pipeline.check_health():
-                log.warning("Health check failed — restarting pipeline")
-                self._async_restart()
+                if not self._health_restart_pending:
+                    log.warning("Health check failed — restarting pipeline")
+                self._async_restart(health_restart=True)
         return True  # keep timer
+
+    def _on_reconcile_tick(self):
+        """Backstop event-driven link repair with a periodic graph check."""
+        if self._quitting:
+            return GLib.SOURCE_REMOVE
+        if self.pipeline.running:
+            self.pipeline._request_mic_reconcile()
+        return True
 
     @staticmethod
     def _show_error(msg: str):
@@ -2530,13 +3280,7 @@ def main():
 
     # Clean shutdown on signals
     def _shutdown(*_args):
-        tray._quitting = True
-        tray._route_restart_pending = False
-        if tray._pw_monitor:
-            tray._pw_monitor.stop()
-        pipeline.stop()
-        save_config(config)
-        Gtk.main_quit()
+        tray._begin_shutdown()
         return GLib.SOURCE_REMOVE
 
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, _shutdown)
@@ -2545,9 +3289,6 @@ def main():
     log.info("Tray ready — entering GTK main loop")
     Gtk.main()
 
-    # Belt-and-suspenders cleanup
-    pipeline.stop()
-    save_config(config)
     log.info("%s shutdown complete", APP_NAME)
 
 
