@@ -3,6 +3,7 @@ log = Log.open_topic ("clearvoice-lock")
 local lock_enabled = Settings.get_boolean ("clearvoice.lock-base-mic-audio")
 local base_mic_node = Settings.get_string ("clearvoice.base-mic-node") or ""
 local base_mic_gain = Settings.get_float ("clearvoice.base-mic-gain")
+local output_lock_enabled = Settings.get_boolean ("clearvoice.lock-output-volume")
 local mixer = nil
 
 local audio_sources = ObjectManager {
@@ -41,21 +42,25 @@ local function refresh_permissions ()
 end
 
 local function enforce_gain ()
-  if mixer == nil or not lock_active () then
+  if mixer == nil then
     return
   end
 
-  for node in audio_sources:iterate (
-      Interest {
-        type = "node",
-        Constraint { "node.name", "=", base_mic_node, type = "pw-global" },
-      }) do
-    local id = node["bound-id"]
-    local current = mixer:call ("get-volume", id)
-    if current ~= nil and math.abs (current.volume - base_mic_gain) > 0.005 then
-      mixer:call ("set-volume", id, { volume = base_mic_gain })
+  for node in audio_sources:iterate () do
+    local name = node.properties["node.name"]
+    local target = nil
+    if lock_active () and name == base_mic_node then
+      target = base_mic_gain
+    elseif output_lock_enabled and name == "clearvoice_source" then
+      target = 1.0
     end
-    return
+    if target ~= nil then
+      local id = node["bound-id"]
+      local current = mixer:call ("get-volume", id)
+      if current ~= nil and math.abs (current.volume - target) > 0.005 then
+        mixer:call ("set-volume", id, { volume = target })
+      end
+    end
   end
 end
 
@@ -63,6 +68,7 @@ Settings.subscribe ("clearvoice.*", function ()
   lock_enabled = Settings.get_boolean ("clearvoice.lock-base-mic-audio")
   base_mic_node = Settings.get_string ("clearvoice.base-mic-node") or ""
   base_mic_gain = Settings.get_float ("clearvoice.base-mic-gain")
+  output_lock_enabled = Settings.get_boolean ("clearvoice.lock-output-volume")
   refresh_permissions ()
   enforce_gain ()
 end)
@@ -114,18 +120,7 @@ audio_sources:activate ()
 mixer = Plugin.find ("mixer-api")
 if mixer ~= nil then
   mixer["scale"] = "cubic"
-  mixer:connect ("changed", function (_, id)
-    for node in audio_sources:iterate (
-        Interest {
-          type = "node",
-          Constraint { "node.name", "=", base_mic_node, type = "pw-global" },
-        }) do
-      if node["bound-id"] == id then
-        enforce_gain ()
-        return
-      end
-    end
-  end)
+  mixer:connect ("changed", function () enforce_gain () end)
   enforce_gain ()
 else
   log:error ("mixer API is unavailable")

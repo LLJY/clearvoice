@@ -121,6 +121,7 @@ DEFAULT_CONFIG = {
     "speaker_gain_percent": 80,
     "headphone_gain_percent": 100,
     "lock_base_mic_audio": True,
+    "lock_output_volume": True,
     "noise_cancellation": {
         "enabled": True,
         "attenuation_limit_db": 100,
@@ -1258,6 +1259,12 @@ class PipelineManager:
     def _publish_input_gain(percent: int) -> bool:
         return wp_set_setting("clearvoice.base-mic-gain", f"{percent / 100:.2f}")
 
+    @staticmethod
+    def _publish_output_volume_lock(locked: bool) -> bool:
+        return wp_set_setting(
+            "clearvoice.lock-output-volume", str(bool(locked)).lower()
+        )
+
     def set_input_gain(self, percent: int) -> bool:
         percent = _clamp_percent(percent, DEFAULT_CONFIG["input_gain_percent"])
         self.config["input_gain_percent"] = percent
@@ -1275,6 +1282,13 @@ class PipelineManager:
         if pw_node_exists(VIRTUAL_MIC_NAME):
             return pw_set_node_volume(VIRTUAL_MIC_NAME, percent)
         return False
+
+    def set_output_volume_lock(self, locked: bool) -> bool:
+        self.config["lock_output_volume"] = bool(locked)
+        if not self._running:
+            return True
+        policy_set = self._publish_output_volume_lock(locked)
+        return policy_set and (not locked or self.set_output_gain(100))
 
     def set_route_gains(self, speaker_percent: int, headphone_percent: int) -> bool:
         """Save and immediately apply the gain for the active output route."""
@@ -1627,9 +1641,12 @@ class PipelineManager:
             # ── Stage 3: Set mic as default + configured output gain ──
             if needs_mic:
                 time.sleep(0.3)
-                output_gain_ready = self.set_output_gain(
-                    self.config["output_gain_percent"]
+                output_gain = (
+                    100
+                    if self.config["lock_output_volume"]
+                    else self.config["output_gain_percent"]
                 )
+                output_gain_ready = self.set_output_gain(output_gain)
                 if not pw_set_default_source(final_node):
                     return self._fail_start(
                         f"Could not set default source to {final_node}"
@@ -1640,6 +1657,9 @@ class PipelineManager:
             lock_state = self.config["lock_base_mic_audio"] if needs_mic else False
             if not self._publish_lock_state(lock_state):
                 return self._fail_start("Could not publish base mic audio lock policy")
+            output_lock = self.config["lock_output_volume"] if needs_mic else False
+            if not self._publish_output_volume_lock(output_lock):
+                return self._fail_start("Could not publish ClearVoice volume lock")
 
             self._running = True
             return True, "Pipeline active"
@@ -1661,6 +1681,7 @@ class PipelineManager:
         log.info("Stopping pipeline")
 
         self._publish_lock_state(False)
+        self._publish_output_volume_lock(False)
         self._kill_all()
         self._restore_previous_defaults()
         self._base_mic_node = None
@@ -1672,6 +1693,7 @@ class PipelineManager:
     def _fail_start(self, msg: str) -> tuple[bool, str]:
         self._running = False
         self._publish_lock_state(False)
+        self._publish_output_volume_lock(False)
         self._kill_all()
         self._restore_previous_defaults()
         self._base_mic_node = None
@@ -1841,6 +1863,13 @@ class ClearVoiceTray:
         self._mi_lock_base_mic.set_active(self.config["lock_base_mic_audio"])
         self._mi_lock_base_mic.connect("toggled", self._on_lock_base_mic)
         m.append(self._mi_lock_base_mic)
+
+        self._mi_lock_output_volume = Gtk.CheckMenuItem(
+            label="Lock ClearVoice Volume"
+        )
+        self._mi_lock_output_volume.set_active(self.config["lock_output_volume"])
+        self._mi_lock_output_volume.connect("toggled", self._on_lock_output_volume)
+        m.append(self._mi_lock_output_volume)
 
         mi_gains = Gtk.MenuItem(label="Audio Gains…")
         mi_gains.connect("activate", self._on_audio_gains)
@@ -2030,6 +2059,33 @@ class ClearVoiceTray:
 
         threading.Thread(target=_do, daemon=True).start()
 
+    def _on_lock_output_volume(self, item):
+        locked = item.get_active()
+        previous = self.config["lock_output_volume"]
+        if locked == previous:
+            return
+        self.config["lock_output_volume"] = locked
+        if locked:
+            self.config["output_gain_percent"] = 100
+        save_config(self.config)
+        item.set_sensitive(False)
+
+        def _do():
+            if self.pipeline.set_output_volume_lock(locked):
+                GLib.idle_add(item.set_sensitive, True)
+                return
+
+            def _restore():
+                self.config["lock_output_volume"] = previous
+                save_config(self.config)
+                item.set_active(previous)
+                item.set_sensitive(True)
+                self._show_error("Could not update ClearVoice volume lock")
+
+            GLib.idle_add(_restore)
+
+        threading.Thread(target=_do, daemon=True).start()
+
     def _on_audio_gains(self, _item):
         dialog = Gtk.Dialog(title="Audio Gains", transient_for=None, flags=0)
         dialog.set_default_size(720, -1)
@@ -2070,6 +2126,9 @@ class ClearVoiceTray:
             scale.set_digits(0)
             scale.set_draw_value(True)
             scale.set_hexpand(True)
+            if key == "output_gain_percent" and self.config["lock_output_volume"]:
+                scale.set_value(100)
+                scale.set_sensitive(False)
             hbox.pack_start(scale, True, True, 0)
             box.add(hbox)
             scales[key] = scale
@@ -2077,7 +2136,11 @@ class ClearVoiceTray:
         dialog.show_all()
         if dialog.run() == Gtk.ResponseType.OK:
             input_gain = int(scales["input_gain_percent"].get_value())
-            output_gain = int(scales["output_gain_percent"].get_value())
+            output_gain = (
+                100
+                if self.config["lock_output_volume"]
+                else int(scales["output_gain_percent"].get_value())
+            )
             speaker_gain = int(scales["speaker_gain_percent"].get_value())
             headphone_gain = int(scales["headphone_gain_percent"].get_value())
             self.config["input_gain_percent"] = input_gain

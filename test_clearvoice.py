@@ -556,6 +556,19 @@ def test_default_source_failure_unlocks_kills_and_restores():
     )
     assert failed_default < unlock < killed < restored
 
+def test_output_volume_lock_forces_unity_and_can_be_disabled():
+    manager = clearvoice.PipelineManager(_config())
+    manager._running = True
+    with (
+        patch.object(manager, "_publish_output_volume_lock", return_value=True),
+        patch.object(manager, "set_output_gain", return_value=True) as set_gain,
+    ):
+        assert manager.set_output_volume_lock(True)
+        set_gain.assert_called_once_with(100)
+        set_gain.reset_mock()
+        assert manager.set_output_volume_lock(False)
+        set_gain.assert_not_called()
+
 
 def main():
     for name, test in sorted(globals().items()):
