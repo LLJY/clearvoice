@@ -6,6 +6,7 @@ APP_NAME="ClearVoice"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="$HOME/.local/share/$APP_ID"
 DESKTOP_DIR="$HOME/.config/autostart"
+APPLICATIONS_DIR="$HOME/.local/share/applications"
 WIREPLUMBER_CONFIG_DIR="$HOME/.config/wireplumber/wireplumber.conf.d"
 WIREPLUMBER_SCRIPT_DIR="$HOME/.local/share/wireplumber/scripts"
 PRIVATE_BEAMFORMER="$HOME/.local/lib/clearvoice/spa-0.2/aec/libspa-aec-webrtc.so"
@@ -98,9 +99,9 @@ if [[ ! -f "$PRIVATE_BEAMFORMER" ]]; then
     echo "  WARNING: private beamformer missing; run ./build-beamformer.sh"
 fi
 
-# ── Autostart .desktop file ──────────────────────────────────────────────────
-mkdir -p "$DESKTOP_DIR"
-cat > "$DESKTOP_DIR/$APP_ID.desktop" <<DESKTOP
+# ── Application and autostart entries ────────────────────────────────────────
+mkdir -p "$APPLICATIONS_DIR" "$DESKTOP_DIR"
+cat > "$APPLICATIONS_DIR/$APP_ID.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=$APP_NAME
@@ -112,8 +113,10 @@ Categories=AudioVideo;Audio;
 X-GNOME-Autostart-enabled=true
 X-KDE-autostart-after=panel
 DESKTOP
+cp "$APPLICATIONS_DIR/$APP_ID.desktop" "$DESKTOP_DIR/$APP_ID.desktop"
 
-echo "  Autostart entry: $DESKTOP_DIR/$APP_ID.desktop"
+echo "  Application entry: $APPLICATIONS_DIR/$APP_ID.desktop"
+echo "  Autostart entry:   $DESKTOP_DIR/$APP_ID.desktop"
 echo ""
 echo "Done. $APP_NAME will start on next login."
 echo "Restart audio policy once after installation:"
