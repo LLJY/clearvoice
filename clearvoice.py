@@ -996,6 +996,7 @@ def _pw_conf_filter_chain(
         f'                node.description = "{VIRTUAL_MIC_DESC}"\n'
         "                media.class      = Audio/Source\n"
         "                audio.rate       = 48000\n"
+        "                session.suspend-timeout-seconds = 0\n"
         "                state.restore-props = false\n"
         "            }\n"
         "        }\n"

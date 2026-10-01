@@ -425,6 +425,7 @@ def test_generated_configs_have_clearvoice_identity_and_restore_settings():
     for conf in (filter_conf, echo_conf, intermediate_echo_conf):
         assert 'application.id = "org.clearvoice.ClearVoice"' in conf
         assert "clearvoice.client = true" in conf
+    assert "session.suspend-timeout-seconds = 0" in filter_conf
     assert "state.restore-props = false" in filter_conf
     assert "monitor.mode = true" in echo_conf
     assert "state.restore-props = false" in echo_conf
