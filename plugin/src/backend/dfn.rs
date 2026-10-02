@@ -7,7 +7,7 @@ pub const HOP: usize = 480;
 pub const DELAY: usize = 480;
 pub const SETTLE_FRAMES: usize = 1;
 
-const CONTROL_DEFAULTS: [f32; 5] = [100.0, -15.0, 35.0, 35.0, 0.0];
+pub(crate) const CONTROL_DEFAULTS: [f32; 5] = [100.0, -15.0, 35.0, 35.0, 0.0];
 const CONTROL_BOUNDS: [(f32, f32); 5] = [
     (0.0, 100.0),
     (-15.0, 35.0),
@@ -44,21 +44,11 @@ impl DfnBackend {
     }
 
     pub(crate) fn attenuation_bypasses(value: f32) -> bool {
-        value.is_finite() && value.clamp(0.0, 100.0) < 0.01
-    }
-
-    fn normalized_control(index: usize, value: f32) -> Option<f32> {
-        let default = *CONTROL_DEFAULTS.get(index)?;
-        let (min, max) = *CONTROL_BOUNDS.get(index)?;
-        Some(if value.is_finite() {
-            value.clamp(min, max)
-        } else {
-            default
-        })
+        attenuation_bypasses(value)
     }
 
     fn apply_control(&mut self, index: usize, value: f32) {
-        let Some(value) = Self::normalized_control(index, value) else {
+        let Some(value) = normalized_control(index, value) else {
             return;
         };
         // Below 0.01 dB libDF passes input through with zero delay and frozen history; the
@@ -79,6 +69,20 @@ impl DfnBackend {
             _ => {}
         }
     }
+}
+
+pub(crate) fn attenuation_bypasses(value: f32) -> bool {
+    value.is_finite() && value.clamp(0.0, 100.0) < 0.01
+}
+
+pub(crate) fn normalized_control(index: usize, value: f32) -> Option<f32> {
+    let default = *CONTROL_DEFAULTS.get(index)?;
+    let (min, max) = *CONTROL_BOUNDS.get(index)?;
+    Some(if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        default
+    })
 }
 
 impl Backend for DfnBackend {

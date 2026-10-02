@@ -1,10 +1,7 @@
-use std::path::PathBuf;
-use std::sync::OnceLock;
-
-use ort::ep::CPU;
-use ort::session::{Session, SessionInputValue, builder::GraphOptimizationLevel};
+use ort::session::{Session, SessionInputValue};
 use ort::value::{Outlet, Tensor, TensorElementType};
 
+use crate::backend::build_ort_session;
 use crate::engine::{Backend, BackendFactory};
 
 // ponytail: six-cache ceiling matches shipped B/S/M; raise it with a new model.
@@ -81,27 +78,7 @@ impl FastEnhancer {
     }
 
     fn new(model: Model) -> Result<Self, String> {
-        initialize_ort()?;
-        let mut builder = Session::builder()
-            .map_err(|error| format!("could not create {} session: {error}", model.name()))?;
-        builder = builder
-            .with_no_environment_execution_providers()
-            .map_err(|error| error.to_string())?
-            .with_execution_providers([CPU::default().build()])
-            .map_err(|error| error.to_string())?
-            .with_intra_threads(1)
-            .map_err(|error| error.to_string())?
-            .with_inter_threads(1)
-            .map_err(|error| error.to_string())?
-            .with_parallel_execution(false)
-            .map_err(|error| error.to_string())?
-            .with_intra_op_spinning(false)
-            .map_err(|error| error.to_string())?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|error| error.to_string())?;
-        let session = builder
-            .commit_from_memory(model.bytes())
-            .map_err(|error| format!("could not load {} model: {error}", model.name()))?;
+        let session = build_ort_session(model.name(), model.bytes())?;
         let io = validate_io(&session, model)?;
         let inputs = io
             .input_shapes
@@ -117,23 +94,6 @@ impl FastEnhancer {
             delay: io.delay,
         })
     }
-}
-
-fn initialize_ort() -> Result<(), String> {
-    static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
-    ORT_INIT
-        .get_or_init(|| {
-            let library = std::env::var_os("CLEARVOICE_ORT_DYLIB")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "/usr/lib/libonnxruntime.so.1".into());
-            let environment = ort::init_from(&library)
-                .map_err(|error| format!("could not load {}: {error}", library.display()))?;
-            if !environment.commit() {
-                return Err("ONNX Runtime environment was already configured".to_owned());
-            }
-            Ok(())
-        })
-        .clone()
 }
 
 fn tensor(shape: &[usize], model: Model) -> Result<Tensor<f32>, String> {
