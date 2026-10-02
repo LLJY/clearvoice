@@ -1,0 +1,14 @@
+[package]
+name = "clearvoice-ladspa"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "clearvoice_ladspa"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract", "default-model", "default-model-ll"] }
+ndarray = "=0.15.6"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "api-27"] }
+rtrb = "=0.4.0"
