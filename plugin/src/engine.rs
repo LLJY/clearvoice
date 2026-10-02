@@ -1760,8 +1760,9 @@ mod tests {
         let stall = 66 * 480;
         let input = (0..stall).map(signal_at).collect::<Vec<_>>();
         let mut output = vec![0.0; input.len()];
-        engine.run(&input, &mut output);
+        engine.run(&input[..480], &mut output[..480]);
         gate.wait_entered();
+        engine.run(&input[480..], &mut output[480..]);
         assert!(engine.stats().input_dropped > 0);
         assert!(
             output[latency..]
@@ -2107,7 +2108,19 @@ mod tests {
         let _guard = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = worker_thread_count();
+        // A joined thread can stay listed in /proc/self/task briefly after join returns;
+        // wait for the count to reach zero (bounded) instead of sampling it once.
+        let settles_to_zero = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while worker_thread_count() != 0 {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            true
+        };
+        assert!(settles_to_zero(), "workers from earlier tests never exited");
         for _ in 0..8 {
             let (mut engine, signal, _) = spawn_backend(|| DelayedIdentity::new(480, 1.0));
             signal.wait_parked(0);
@@ -2115,6 +2128,9 @@ mod tests {
             engine.deactivate();
             drop(engine);
         }
-        assert_eq!(worker_thread_count(), before);
+        assert!(
+            settles_to_zero(),
+            "a dropped engine leaked its worker thread"
+        );
     }
 }
