@@ -1542,9 +1542,12 @@ def test_generated_configs_have_clearvoice_identity_and_restore_settings():
     echo_conf = clearvoice._pw_conf_echo_cancel(monitor_mode=True)
     intermediate_echo_conf = clearvoice._pw_conf_echo_cancel(is_intermediate=True)
 
+    speaker_conf = clearvoice.SPEAKER_CHAIN_CONF.read_text()
     for conf in (filter_conf, echo_conf, intermediate_echo_conf):
         assert 'application.id = "org.clearvoice.ClearVoice"' in conf
         assert "clearvoice.client = true" in conf
+    for conf in (filter_conf, plain_filter_conf, echo_conf, intermediate_echo_conf, speaker_conf):
+        assert "cpu.zero.denormals = true" in conf
     assert "session.suspend-timeout-seconds = 0" in filter_conf
     assert "state.restore-props = false" in filter_conf
     assert "monitor.mode = true" in echo_conf
@@ -1693,6 +1696,8 @@ def test_noise_model_config_generation_and_stock_remains_unchanged():
         generated = clearvoice._pw_conf_filter_chain(
             "/tmp/deepfilter.so", model="stock", latency_ms=35, **dict(kwargs)
         )
+        # The only intended change since 9a8078d: denormal flushing on data loops.
+        generated = generated.replace("    cpu.zero.denormals = true\n", "", 1)
         assert hashlib.sha256(generated.encode()).hexdigest() == digest
     stock = clearvoice._pw_conf_filter_chain("/tmp/deepfilter.so")
     assert "label  = deep_filter_mono" in stock

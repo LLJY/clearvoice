@@ -1274,6 +1274,7 @@ def _pw_conf_filter_chain(
         "# ClearVoice filter-chain (auto-generated)\n"
         "context.properties = {\n"
         "    log.level = 0\n"
+        "    cpu.zero.denormals = true\n"
         '    application.name = "ClearVoice"\n'
         '    application.id = "org.clearvoice.ClearVoice"\n'
         "    clearvoice.client = true\n"
@@ -1402,6 +1403,7 @@ def _pw_conf_echo_cancel(
         "# ClearVoice echo-cancel (auto-generated)\n"
         "context.properties = {\n"
         "    log.level = 0\n"
+        "    cpu.zero.denormals = true\n"
         '    application.name = "ClearVoice"\n'
         '    application.id = "org.clearvoice.ClearVoice"\n'
         "    clearvoice.client = true\n"
