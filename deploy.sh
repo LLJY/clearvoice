@@ -10,6 +10,7 @@ APPLICATIONS_DIR="$HOME/.local/share/applications"
 WIREPLUMBER_CONFIG_DIR="$HOME/.config/wireplumber/wireplumber.conf.d"
 WIREPLUMBER_SCRIPT_DIR="$HOME/.local/share/wireplumber/scripts"
 PRIVATE_BEAMFORMER="$HOME/.local/lib/clearvoice/spa-0.2/aec/libspa-aec-webrtc.so"
+PRIVATE_CLEARVOICE_PLUGIN="$HOME/.local/lib/clearvoice/ladspa/libclearvoice_ladspa.so"
 
 # ── Dependency check ──────────────────────────────────────────────────────────
 echo "Checking dependencies..."
@@ -48,6 +49,13 @@ if [ "$ladspa_found" = false ]; then
     echo "  MISSING: libdeep_filter_ladspa.so"
     echo "    Install: paru -S libdeep_filter_ladspa-bin"
     ok=false
+fi
+
+if [ -f "$PRIVATE_CLEARVOICE_PLUGIN" ]; then
+    echo "  OK: optional ClearVoice constant-latency LADSPA ($PRIVATE_CLEARVOICE_PLUGIN)"
+else
+    echo "  WARNING: optional ClearVoice LADSPA plugin missing; stock DeepFilterNet remains the default"
+    echo "    Build it with: $SCRIPT_DIR/build-plugin.sh"
 fi
 
 # Python + PyGObject
