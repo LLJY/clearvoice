@@ -1543,12 +1543,9 @@ def test_generated_configs_have_clearvoice_identity_and_restore_settings():
     intermediate_echo_conf = clearvoice._pw_conf_echo_cancel(is_intermediate=True)
 
     speaker_conf = clearvoice.SPEAKER_CHAIN_CONF.read_text()
-    speaker_conf = clearvoice.SPEAKER_CHAIN_CONF.read_text()
     for conf in (filter_conf, echo_conf, intermediate_echo_conf):
         assert 'application.id = "org.clearvoice.ClearVoice"' in conf
         assert "clearvoice.client = true" in conf
-    for conf in (filter_conf, plain_filter_conf, echo_conf, intermediate_echo_conf, speaker_conf):
-        assert "cpu.zero.denormals = true" in conf
     for conf in (filter_conf, plain_filter_conf, echo_conf, intermediate_echo_conf, speaker_conf):
         assert "cpu.zero.denormals = true" in conf
     assert "session.suspend-timeout-seconds = 0" in filter_conf
@@ -1701,8 +1698,6 @@ def test_noise_model_config_generation_and_stock_remains_unchanged():
         )
         # The only intended change since 9a8078d: denormal flushing on data loops.
         generated = generated.replace("    cpu.zero.denormals = true\n", "", 1)
-        # The only intended change since 9a8078d: denormal flushing on data loops.
-        generated = generated.replace("    cpu.zero.denormals = true\n", "", 1)
         assert hashlib.sha256(generated.encode()).hexdigest() == digest
     stock = clearvoice._pw_conf_filter_chain("/tmp/deepfilter.so")
     assert "label  = deep_filter_mono" in stock
@@ -1718,6 +1713,30 @@ def test_noise_model_config_generation_and_stock_remains_unchanged():
         '                            "Latency (ms)" = 35'
     ) in dfn3
     assert dfn3.count("node.latency = 256/48000") == 2
+
+    dfn3_int8 = clearvoice._pw_conf_filter_chain(
+        "/tmp/clearvoice.so",
+        model="dfn3-ll-int8",
+        latency_ms=47,
+        attenuation_db=80,
+        min_proc_db=-10,
+        max_erb_db=30,
+        max_df_db=25,
+        post_filter_beta=0.02,
+    )
+    assert "label  = clearvoice_dfn3_ll_int8_mono" in dfn3_int8
+    assert (
+        '"Attenuation Limit (dB)" = 80\n'
+        '                            "Min processing threshold (dB)" = -10\n'
+        '                            "Max ERB processing threshold (dB)" = 30\n'
+        '                            "Max DF processing threshold (dB)" = 25\n'
+        '                            "Post Filter Beta" = 0.02\n'
+        '                            "Latency (ms)" = 47'
+    ) in dfn3_int8
+    assert dfn3_int8.count("node.latency = 256/48000") == 2
+    assert list(clearvoice.NOISE_MODELS)[
+        list(clearvoice.NOISE_MODELS).index("dfn3-ll") + 1
+    ] == "dfn3-ll-int8"
 
     fastenhancer = clearvoice._pw_conf_filter_chain(
         "/tmp/clearvoice.so", model="fastenhancer-b", latency_ms=35
@@ -1783,27 +1802,42 @@ def test_noise_model_config_validation_defaults_unknown_and_clamps_latency():
             loaded = clearvoice.load_config()
     assert loaded["noise_cancellation"]["model"] == "fastenhancer-m"
 
+    with tempfile.TemporaryDirectory() as directory:
+        config_path = Path(directory) / "config.json"
+        config_path.write_text(
+            json.dumps({"noise_cancellation": {"model": "dfn3-ll-int8"}})
+        )
+        with patch.object(clearvoice, "CONFIG_FILE", config_path):
+            loaded = clearvoice.load_config()
+    assert loaded["noise_cancellation"]["model"] == "dfn3-ll-int8"
+
+
+def test_int8_noise_model_is_immediately_after_fp32_in_tray_order():
+    model_order = list(clearvoice.NOISE_MODELS)
+    assert model_order[model_order.index("dfn3-ll") + 1] == "dfn3-ll-int8"
+
 
 def test_missing_optional_plugin_falls_back_without_persisting_preference():
-    config = _config()
-    config["noise_cancellation"]["model"] = "dfn3-ll"
-    manager = clearvoice.PipelineManager(config)
-    with tempfile.TemporaryDirectory() as directory:
-        missing_plugin = Path(directory) / "missing.so"
-        with (
-            patch.object(clearvoice, "CLEARVOICE_LADSPA_PLUGIN", missing_plugin),
-            patch.object(
-                manager, "_launch_filter_chain", return_value=(True, "")
-            ) as launch,
-            patch.object(clearvoice, "save_config") as save,
-        ):
-            assert manager._start_filter_chain("mic", "/stock.so")[0]
-    assert launch.call_args.args[0:2] == ("stock", "/stock.so")
-    assert manager.plugin_fallback_active
-    assert manager.noise_model == "dfn3-ll"
-    assert config["noise_cancellation"]["model"] == "dfn3-ll"
-    assert "not found" in manager.take_fallback_notice()
-    save.assert_not_called()
+    for model in ("dfn3-ll", "dfn3-ll-int8"):
+        config = _config()
+        config["noise_cancellation"]["model"] = model
+        manager = clearvoice.PipelineManager(config)
+        with tempfile.TemporaryDirectory() as directory:
+            missing_plugin = Path(directory) / "missing.so"
+            with (
+                patch.object(clearvoice, "CLEARVOICE_LADSPA_PLUGIN", missing_plugin),
+                patch.object(
+                    manager, "_launch_filter_chain", return_value=(True, "")
+                ) as launch,
+                patch.object(clearvoice, "save_config") as save,
+            ):
+                assert manager._start_filter_chain("mic", "/stock.so")[0]
+        assert launch.call_args.args[0:2] == ("stock", "/stock.so")
+        assert manager.plugin_fallback_active
+        assert manager.noise_model == model
+        assert config["noise_cancellation"]["model"] == model
+        assert "not found" in manager.take_fallback_notice()
+        save.assert_not_called()
 
 
 def test_custom_filter_chain_start_failure_retries_stock_once():

@@ -76,12 +76,14 @@ CLEARVOICE_LADSPA_PLUGIN = (
 NOISE_MODELS = {
     "stock": "Stock DeepFilterNet",
     "dfn3-ll": "DeepFilterNet3-LL (constant latency)",
+    "dfn3-ll-int8": "DeepFilterNet3-LL int8",
     "fastenhancer-b": "FastEnhancer-B",
     "fastenhancer-s": "FastEnhancer-S",
     "fastenhancer-m": "FastEnhancer-M",
 }
 CLEARVOICE_LADSPA_LABELS = {
     "dfn3-ll": "clearvoice_dfn3_ll_mono",
+    "dfn3-ll-int8": "clearvoice_dfn3_ll_int8_mono",
     "fastenhancer-b": "clearvoice_fastenhancer_b_mono",
     "fastenhancer-s": "clearvoice_fastenhancer_s_mono",
     "fastenhancer-m": "clearvoice_fastenhancer_m_mono",
@@ -1174,7 +1176,7 @@ def _pw_conf_filter_chain(
         model = "stock"
     latency_ms = _clamp_latency_ms(latency_ms)
     label = CLEARVOICE_LADSPA_LABELS.get(model, DEEPFILTER_LABEL_MONO)
-    if model in ("stock", "dfn3-ll"):
+    if model in ("stock", "dfn3-ll", "dfn3-ll-int8"):
         extra_latency_control = (
             f'                            "Latency (ms)" = {latency_ms}\n'
             if model != "stock"
@@ -1276,7 +1278,6 @@ def _pw_conf_filter_chain(
         "# ClearVoice filter-chain (auto-generated)\n"
         "context.properties = {\n"
         "    log.level = 0\n"
-        "    cpu.zero.denormals = true\n"
         "    cpu.zero.denormals = true\n"
         '    application.name = "ClearVoice"\n'
         '    application.id = "org.clearvoice.ClearVoice"\n'
@@ -1406,7 +1407,6 @@ def _pw_conf_echo_cancel(
         "# ClearVoice echo-cancel (auto-generated)\n"
         "context.properties = {\n"
         "    log.level = 0\n"
-        "    cpu.zero.denormals = true\n"
         "    cpu.zero.denormals = true\n"
         '    application.name = "ClearVoice"\n'
         '    application.id = "org.clearvoice.ClearVoice"\n'
