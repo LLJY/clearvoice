@@ -1543,9 +1543,12 @@ def test_generated_configs_have_clearvoice_identity_and_restore_settings():
     intermediate_echo_conf = clearvoice._pw_conf_echo_cancel(is_intermediate=True)
 
     speaker_conf = clearvoice.SPEAKER_CHAIN_CONF.read_text()
+    speaker_conf = clearvoice.SPEAKER_CHAIN_CONF.read_text()
     for conf in (filter_conf, echo_conf, intermediate_echo_conf):
         assert 'application.id = "org.clearvoice.ClearVoice"' in conf
         assert "clearvoice.client = true" in conf
+    for conf in (filter_conf, plain_filter_conf, echo_conf, intermediate_echo_conf, speaker_conf):
+        assert "cpu.zero.denormals = true" in conf
     for conf in (filter_conf, plain_filter_conf, echo_conf, intermediate_echo_conf, speaker_conf):
         assert "cpu.zero.denormals = true" in conf
     assert "session.suspend-timeout-seconds = 0" in filter_conf
@@ -1698,6 +1701,8 @@ def test_noise_model_config_generation_and_stock_remains_unchanged():
         )
         # The only intended change since 9a8078d: denormal flushing on data loops.
         generated = generated.replace("    cpu.zero.denormals = true\n", "", 1)
+        # The only intended change since 9a8078d: denormal flushing on data loops.
+        generated = generated.replace("    cpu.zero.denormals = true\n", "", 1)
         assert hashlib.sha256(generated.encode()).hexdigest() == digest
     stock = clearvoice._pw_conf_filter_chain("/tmp/deepfilter.so")
     assert "label  = deep_filter_mono" in stock
@@ -1737,6 +1742,15 @@ def test_noise_model_config_generation_and_stock_remains_unchanged():
     assert "label  = clearvoice_fastenhancer_s_mono" in fastenhancer_s
     assert '"Latency (ms)" = 80' in fastenhancer_s
 
+    fastenhancer_m = clearvoice._pw_conf_filter_chain(
+        "/tmp/clearvoice.so", model="fastenhancer-m", latency_ms=35
+    )
+    assert "label  = clearvoice_fastenhancer_m_mono" in fastenhancer_m
+    assert '"Latency (ms)" = 35' in fastenhancer_m
+    assert fastenhancer_m.count("node.latency = 256/48000") == 2
+    assert clearvoice.NOISE_MODELS["fastenhancer-m"] == "FastEnhancer-M"
+    assert list(clearvoice.NOISE_MODELS)[-1] == "fastenhancer-m"
+
 
 def test_noise_model_config_validation_defaults_unknown_and_clamps_latency():
     assert _config()["noise_cancellation"]["model"] == "stock"
@@ -1759,6 +1773,15 @@ def test_noise_model_config_validation_defaults_unknown_and_clamps_latency():
     assert loaded["noise_cancellation"]["model"] == "stock"
     assert loaded["noise_cancellation"]["latency_ms"] == 200
     warning.assert_called_once()
+
+    with tempfile.TemporaryDirectory() as directory:
+        config_path = Path(directory) / "config.json"
+        config_path.write_text(
+            json.dumps({"noise_cancellation": {"model": "fastenhancer-m"}})
+        )
+        with patch.object(clearvoice, "CONFIG_FILE", config_path):
+            loaded = clearvoice.load_config()
+    assert loaded["noise_cancellation"]["model"] == "fastenhancer-m"
 
 
 def test_missing_optional_plugin_falls_back_without_persisting_preference():
