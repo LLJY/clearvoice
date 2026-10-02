@@ -70,6 +70,20 @@ EC_SOURCE_DESC = "ClearVoice Beamformed"
 DEEPFILTER_SO = "libdeep_filter_ladspa.so"
 DEEPFILTER_LABEL_MONO = "deep_filter_mono"
 DEEPFILTER_LABEL_STEREO = "deep_filter_stereo"
+CLEARVOICE_LADSPA_PLUGIN = (
+    Path.home() / ".local/lib/clearvoice/ladspa/libclearvoice_ladspa.so"
+)
+NOISE_MODELS = {
+    "stock": "Stock DeepFilterNet",
+    "dfn3-ll": "DeepFilterNet3-LL (constant latency)",
+    "fastenhancer-b": "FastEnhancer-B",
+    "fastenhancer-s": "FastEnhancer-S",
+}
+CLEARVOICE_LADSPA_LABELS = {
+    "dfn3-ll": "clearvoice_dfn3_ll_mono",
+    "fastenhancer-b": "clearvoice_fastenhancer_b_mono",
+    "fastenhancer-s": "clearvoice_fastenhancer_s_mono",
+}
 
 LADSPA_SEARCH_PATHS = [
     "/usr/lib/ladspa",
@@ -126,6 +140,8 @@ DEFAULT_CONFIG = {
     "lock_output_volume": True,
     "noise_cancellation": {
         "enabled": True,
+        "model": "stock",
+        "latency_ms": 35,
         "attenuation_limit_db": 100,
         "min_processing_threshold_db": -15,
         "max_erb_threshold_db": 35,
@@ -178,7 +194,24 @@ def load_config() -> dict:
         "headphone_gain_percent",
     ):
         config[key] = _clamp_percent(config.get(key), DEFAULT_CONFIG[key])
+    nc = config["noise_cancellation"]
+    if (
+        not isinstance(nc.get("model"), str)
+        or nc.get("model") not in NOISE_MODELS
+    ):
+        log.warning(
+            "Unknown noise_cancellation.model %r; using stock", nc.get("model")
+        )
+        nc["model"] = "stock"
+    nc["latency_ms"] = _clamp_latency_ms(nc.get("latency_ms", 35))
     return config
+
+
+def _clamp_latency_ms(value) -> int:
+    try:
+        return max(10, min(200, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 35
 
 
 def save_config(config: dict):
@@ -855,7 +888,9 @@ def _pw_link_present(
     )
 
 
-def _deepfilter_thread(pid: int, timeout: float = 2.0) -> tuple[int | None, str]:
+def _deepfilter_thread(
+    pid: int, timeout: float = 2.0, worker_name: str | None = None
+) -> tuple[int | None, str]:
     """Identify the one non-graph PipeWire worker from the plugin's known layout."""
     try:
         result = subprocess.run(
@@ -884,6 +919,18 @@ def _deepfilter_thread(pid: int, timeout: float = 2.0) -> tuple[int | None, str]
         candidates.append((thread_id, comm, scheduling_class))
     if not candidates:
         return None, "inference worker has not appeared"
+    if worker_name is not None:
+        matches = [
+            candidate for candidate in candidates if candidate[1] == worker_name
+        ]
+        if not matches:
+            return None, f"{worker_name} worker has not appeared"
+        if len(matches) != 1 or matches[0][2] not in ("TS", "RR"):
+            return None, "ambiguous PipeWire thread layout: " + ", ".join(
+                f"{tid}:{comm}/{scheduling_class}"
+                for tid, comm, scheduling_class in matches
+            )
+        return matches[0][0], ""
     if (
         len(candidates) != 1
         or candidates[0][1] != "pipewire"
@@ -904,7 +951,10 @@ def _deepfilter_worker_runtime_ns(pid: int, worker: int) -> int | None:
 
 
 def promote_deepfilter_worker(
-    pid: int, timeout: float = 10.0, should_cancel=None
+    pid: int,
+    timeout: float = 10.0,
+    should_cancel=None,
+    worker_name: str | None = None,
 ) -> int | None:
     """Promote the caught-up DeepFilter worker below PipeWire's graph priority."""
     deadline = time.monotonic() + timeout
@@ -916,7 +966,9 @@ def promote_deepfilter_worker(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        worker, reason = _deepfilter_thread(pid, timeout=min(2, remaining))
+        worker, reason = _deepfilter_thread(
+            pid, timeout=min(2, remaining), worker_name=worker_name
+        )
         if worker is not None:
             try:
                 # RTKit sets SCHED_RESET_ON_FORK alongside the policy; ignore that flag.
@@ -948,33 +1000,40 @@ def promote_deepfilter_worker(
                     policy,
                 )
                 return None
-            # Backlog draining can exhaust PipeWire's RLIMIT_RTTIME before promotion.
-            reason = "worker did not become idle before promotion timeout"
-            runtime_before = _deepfilter_worker_runtime_ns(pid, worker)
-            if runtime_before is None:
-                log.debug(
-                    "Skipping DeepFilter promotion: schedstat unreadable for worker %d",
-                    worker,
-                )
-                return None
-            sample_started = time.monotonic()
-            if deadline - sample_started < 0.25:
-                break
-            time.sleep(0.25)
-            if should_cancel and should_cancel():
-                return None
-            runtime_after = _deepfilter_worker_runtime_ns(pid, worker)
-            sample_ns = int((time.monotonic() - sample_started) * 1_000_000_000)
-            if runtime_after is None or sample_ns <= 0 or runtime_after < runtime_before:
-                log.debug(
-                    "Skipping DeepFilter promotion: invalid schedstat sample for worker %d",
-                    worker,
-                )
-                return None
-            if (runtime_after - runtime_before) * 2 >= sample_ns:
-                worker_busy = True
-                reason = "worker remained busy draining its startup backlog"
-                continue
+            # Stock: backlog draining can exhaust PipeWire's RLIMIT_RTTIME before
+            # promotion. cv-dsp-worker discards late frames and naps itself, so it skips
+            # this gate (on battery DFN3-LL is busy > 50% and would never qualify).
+            if worker_name is None:
+                reason = "worker did not become idle before promotion timeout"
+                runtime_before = _deepfilter_worker_runtime_ns(pid, worker)
+                if runtime_before is None:
+                    log.debug(
+                        "Skipping DeepFilter promotion: schedstat unreadable for worker %d",
+                        worker,
+                    )
+                    return None
+                sample_started = time.monotonic()
+                if deadline - sample_started < 0.25:
+                    break
+                time.sleep(0.25)
+                if should_cancel and should_cancel():
+                    return None
+                runtime_after = _deepfilter_worker_runtime_ns(pid, worker)
+                sample_ns = int((time.monotonic() - sample_started) * 1_000_000_000)
+                if (
+                    runtime_after is None
+                    or sample_ns <= 0
+                    or runtime_after < runtime_before
+                ):
+                    log.debug(
+                        "Skipping DeepFilter promotion: invalid schedstat sample for worker %d",
+                        worker,
+                    )
+                    return None
+                if (runtime_after - runtime_before) * 2 >= sample_ns:
+                    worker_busy = True
+                    reason = "worker remained busy draining its startup backlog"
+                    continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -1006,7 +1065,7 @@ def promote_deepfilter_worker(
                         )
                         return None
                     verified, reason = _deepfilter_thread(
-                        pid, timeout=min(2, remaining)
+                        pid, timeout=min(2, remaining), worker_name=worker_name
                     )
                     try:
                         verified_policy = (
@@ -1105,8 +1164,39 @@ def _pw_conf_filter_chain(
     post_filter_beta: float = 0.0,
     target_source: str | None = None,
     studio_voice: bool = True,
+    model: str = "stock",
+    latency_ms: int = 35,
 ) -> str:
     """Build a PipeWire config that loads a DeepFilterNet filter-chain."""
+    if not isinstance(model, str) or model not in NOISE_MODELS:
+        model = "stock"
+    latency_ms = _clamp_latency_ms(latency_ms)
+    label = CLEARVOICE_LADSPA_LABELS.get(model, DEEPFILTER_LABEL_MONO)
+    if model in ("stock", "dfn3-ll"):
+        extra_latency_control = (
+            f'                            "Latency (ms)" = {latency_ms}\n'
+            if model != "stock"
+            else ""
+        )
+        plugin_controls = (
+            "                        control = {\n"
+            f'                            "Attenuation Limit (dB)" = {attenuation_db}\n'
+            f'                            "Min processing threshold (dB)" = {min_proc_db}\n'
+            f'                            "Max ERB processing threshold (dB)" = {max_erb_db}\n'
+            f'                            "Max DF processing threshold (dB)" = {max_df_db}\n'
+            f'                            "Post Filter Beta" = {post_filter_beta}\n'
+            f"{extra_latency_control}"
+            "                        }\n"
+        )
+    else:
+        plugin_controls = (
+            "                        control = {\n"
+            f'                            "Latency (ms)" = {latency_ms}\n'
+            "                        }\n"
+        )
+    requested_latency_props = (
+        "                node.latency = 256/48000\n" if model != "stock" else ""
+    )
     target_line = ""
     if target_source:
         target_line = f'target.object = "{target_source}"'
@@ -1215,14 +1305,8 @@ def _pw_conf_filter_chain(
         "                        type   = ladspa\n"
         "                        name   = deepfilter\n"
         f"                        plugin = {plugin_path}\n"
-        f"                        label  = {DEEPFILTER_LABEL_MONO}\n"
-        "                        control = {\n"
-        f'                            "Attenuation Limit (dB)" = {attenuation_db}\n'
-        f'                            "Min processing threshold (dB)" = {min_proc_db}\n'
-        f'                            "Max ERB processing threshold (dB)" = {max_erb_db}\n'
-        f'                            "Max DF processing threshold (dB)" = {max_df_db}\n'
-        f'                            "Post Filter Beta" = {post_filter_beta}\n'
-        "                        }\n"
+        f"                        label  = {label}\n"
+        f"{plugin_controls}"
         "                    }\n"
         "                    { type = builtin name = restore label = linear\n"
         '                        control = { "Mult" = 1.584893192 "Add" = 0.0 } }\n'
@@ -1257,12 +1341,14 @@ def _pw_conf_filter_chain(
         "                node.passive = true\n"
         "                audio.rate   = 48000\n"
         f"                {target_line}\n"
+        f"{requested_latency_props}"
         "            }\n"
         "            playback.props = {\n"
         f'                node.name        = "{VIRTUAL_MIC_NAME}"\n'
         f'                node.description = "{VIRTUAL_MIC_DESC}"\n'
         "                media.class      = Audio/Source\n"
         "                audio.rate       = 48000\n"
+        f"{requested_latency_props}"
         "                session.suspend-timeout-seconds = 0\n"
         "                state.restore-props = false\n"
         "            }\n"
@@ -1368,6 +1454,20 @@ def _pw_conf_echo_cancel(
     )
 
 
+def _parse_clearvoice_stats(line: str) -> dict | None:
+    match = re.match(r"clearvoice-ladspa stats label=(\S+) (.+)$", line.strip())
+    if not match:
+        return None
+    values = dict(re.findall(r"(\w+)=(\d+)", match.group(2)))
+    if not {"processed", "concealed"} <= values.keys():
+        return None
+    return {
+        "label": match.group(1),
+        "processed": int(values["processed"]),
+        "concealed": int(values["concealed"]),
+    }
+
+
 # ── Pipeline Manager ─────────────────────────────────────────────────────────
 
 
@@ -1382,6 +1482,10 @@ class PipelineManager:
 
     def __init__(self, config: dict):
         self.config = config
+        model = self.config.get("noise_cancellation", {}).get("model", "stock")
+        if not isinstance(model, str) or model not in NOISE_MODELS:
+            log.warning("Unknown noise_cancellation.model %r; using stock", model)
+            self.config.setdefault("noise_cancellation", {})["model"] = "stock"
         self._fc_proc: subprocess.Popen | None = None
         self._ec_proc: subprocess.Popen | None = None
         self._spk_proc: subprocess.Popen | None = None
@@ -1401,6 +1505,15 @@ class PipelineManager:
         self._reconcile_thread: threading.Thread | None = None
         self._generation = 0
         self._shutdown_requested = False
+        self._plugin_fallback = False
+        self._fallback_notice: str | None = None
+        self._fc_model: str | None = None
+        self._fc_log_reader = None  # same inode as the filter-chain's stderr
+        self._fc_log_pending = ""
+        self._fc_stats_previous: tuple[int, int] | None = None
+        self._fc_stats_warning_at: float | None = None
+        self._fc_crash_times: list[float] = []
+        self._fc_crash_counted = False
 
         # Ensure child processes are cleaned up if we crash
         atexit.register(self._kill_all)
@@ -1445,6 +1558,36 @@ class PipelineManager:
     @property
     def studio_enabled(self) -> bool:
         return self.config.get("studio_voice", {}).get("enabled", True)
+
+    @property
+    def noise_model(self) -> str:
+        selected = self.config.get("noise_cancellation", {}).get("model", "stock")
+        if isinstance(selected, str) and selected in NOISE_MODELS:
+            return selected
+        return "stock"
+
+    @property
+    def active_noise_model(self) -> str:
+        return self._fc_model or ("stock" if self._plugin_fallback else self.noise_model)
+
+    @property
+    def plugin_fallback_active(self) -> bool:
+        return self._plugin_fallback
+
+    def _activate_stock_fallback(self, reason: str):
+        if self._plugin_fallback:
+            return
+        self._plugin_fallback = True
+        message = (
+            f"{NOISE_MODELS.get(self.noise_model, 'Selected noise model')} failed; "
+            f"using stock DeepFilterNet for this session: {reason}"
+        )
+        self._fallback_notice = message
+        log.error(message)
+
+    def take_fallback_notice(self) -> str | None:
+        message, self._fallback_notice = self._fallback_notice, None
+        return message
 
     @property
     def any_processing(self) -> bool:
@@ -1768,14 +1911,19 @@ class PipelineManager:
                 active = self._mic_demand
                 revision = self._demand_revision
             try:
+                generation = None
                 with self._lock:
-                    generation = self._generation
                     if (
                         self._running
                         and not self._transitioning
                         and not self._shutdown_requested
                     ):
-                        self._reconcile_mic_demand(active, revision, generation)
+                        generation = self._generation
+                        self._reconcile_aec_links(active, revision, generation)
+                # The promotion wait (up to 10 s) runs outside the lifecycle lock so health
+                # ticks keep running; it cancels on generation/process/demand changes.
+                if generation is not None:
+                    self._reconcile_deepfilter(active, revision, generation)
             except Exception:
                 log.exception("Mic demand reconciliation failed")
             with self._demand_lock:
@@ -1959,11 +2107,12 @@ class PipelineManager:
         def should_cancel():
             return not self._demand_is_current(True, revision, generation, proc)
 
-        promote_deepfilter_worker(proc.pid, should_cancel=should_cancel)
-
-    def _reconcile_mic_demand(self, active: bool, revision: int, generation: int):
-        self._reconcile_aec_links(active, revision, generation)
-        self._reconcile_deepfilter(active, revision, generation)
+        if self._fc_model in CLEARVOICE_LADSPA_LABELS:
+            promote_deepfilter_worker(
+                proc.pid, should_cancel=should_cancel, worker_name="cv-dsp-worker"
+            )
+        else:
+            promote_deepfilter_worker(proc.pid, should_cancel=should_cancel)
 
     # ── Start / Stop ──
 
@@ -2008,6 +2157,129 @@ class PipelineManager:
         except Exception:
             pass
 
+    def _wait_for_filter_chain_node(
+        self, proc: subprocess.Popen, timeout: float = 6.0
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return False
+            if pw_node_exists(VIRTUAL_MIC_NAME):
+                return proc.poll() is None
+            time.sleep(0.25)
+        return False
+
+    def _stop_filter_chain_attempt(self):
+        proc = self._fc_proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    pass
+        self._fc_proc = None
+        self._fc_model = None
+        self._close_filter_chain_log()
+
+    def _close_filter_chain_log(self):
+        reader, self._fc_log_reader = self._fc_log_reader, None
+        if reader is not None:
+            reader.close()
+
+    def _launch_filter_chain(
+        self, model: str, plugin_path: str, target_source: str, nc: dict
+    ) -> tuple[bool, str]:
+        conf = _pw_conf_filter_chain(
+            plugin_path=plugin_path,
+            attenuation_db=nc.get("attenuation_limit_db", 100),
+            min_proc_db=nc.get("min_processing_threshold_db", -15),
+            max_erb_db=nc.get("max_erb_threshold_db", 35),
+            max_df_db=nc.get("max_df_threshold_db", 35),
+            post_filter_beta=nc.get("post_filter_beta", 0.0),
+            target_source=target_source,
+            studio_voice=self.studio_enabled,
+            model=model,
+            latency_ms=nc.get("latency_ms", 35),
+        )
+        conf_path = RUNTIME_DIR / "filter-chain.conf"
+        conf_path.write_text(conf)
+        self._fc_model = model
+        self._fc_crash_counted = False
+        self._fc_log_pending = ""
+        self._fc_stats_previous = None
+
+        log.info("Spawning filter-chain process (%s)", model)
+        try:
+            with open(RUNTIME_DIR / "filter-chain.log", "ab") as fc_log:
+                fc_log.write(
+                    (
+                        f"\n--- filter-chain start "
+                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+                    ).encode()
+                )
+                fc_log.flush()
+                self._close_filter_chain_log()
+                # Reopen the child's stderr inode (not the path) so only this attempt's
+                # new bytes are read, even if the path is later replaced.
+                self._fc_log_reader = open(f"/proc/self/fd/{fc_log.fileno()}", "rb")
+                self._fc_log_reader.seek(0, os.SEEK_END)
+                self._fc_proc = self._spawn_child(
+                    ["pipewire", "-c", str(conf_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=fc_log,
+                )
+        except OSError as exc:
+            self._fc_proc = None
+            self._fc_model = None
+            return False, str(exc)
+        if self._fc_proc is None:
+            self._fc_model = None
+            return False, "Pipeline shutdown requested"
+        if self._shutdown_pending():
+            return False, "Pipeline shutdown requested"
+
+        if not self._wait_for_filter_chain_node(self._fc_proc):
+            stderr = self._read_recent_log("filter-chain")
+            self._stop_filter_chain_attempt()
+            return False, f"Filter-chain failed to start: {stderr}"
+
+        log.info("Filter-chain ready: %s (%s)", VIRTUAL_MIC_NAME, model)
+        return True, ""
+
+    def _start_filter_chain(
+        self, target_source: str, stock_plugin_path: str
+    ) -> tuple[bool, str]:
+        if self._shutdown_pending():
+            return False, "Pipeline shutdown requested"
+        nc = self.config["noise_cancellation"]
+        model = "stock" if self._plugin_fallback else self.noise_model
+        plugin_path = stock_plugin_path
+        if model != "stock":
+            if not CLEARVOICE_LADSPA_PLUGIN.is_file():
+                self._activate_stock_fallback(
+                    f"LADSPA plugin not found: {CLEARVOICE_LADSPA_PLUGIN}"
+                )
+                model = "stock"
+            else:
+                plugin_path = str(CLEARVOICE_LADSPA_PLUGIN)
+
+        ok, reason = self._launch_filter_chain(model, plugin_path, target_source, nc)
+        if ok or model == "stock" or self._shutdown_pending():
+            if self._shutdown_pending():
+                return False, "Pipeline shutdown requested"
+            return ok, reason
+
+        self._activate_stock_fallback(reason)
+        if self._shutdown_pending():
+            return False, reason
+        return self._launch_filter_chain(
+            "stock", stock_plugin_path, target_source, nc
+        )
+
     def _start_locked(self) -> tuple[bool, str]:
         if self._shutdown_pending():
             return False, "Pipeline shutdown requested"
@@ -2038,8 +2310,8 @@ class PipelineManager:
         private_aec_plugin = None
 
         if needs_mic:
-            plugin_path = find_ladspa_plugin(DEEPFILTER_SO)
-            if self.nc_enabled and not plugin_path:
+            stock_plugin_path = find_ladspa_plugin(DEEPFILTER_SO)
+            if self.nc_enabled and not stock_plugin_path:
                 return False, f"LADSPA plugin not found: {DEEPFILTER_SO}"
 
             source = self._resolve_source()
@@ -2178,43 +2450,15 @@ class PipelineManager:
             # ── Stage 2: Filter-chain (DeepFilterNet) ──
             if self.nc_enabled:
                 fc_target = EC_SOURCE_NAME if self.ec_needed else source
-
-                nc = self.config["noise_cancellation"]
-                conf = _pw_conf_filter_chain(
-                    plugin_path=plugin_path,
-                    attenuation_db=nc.get("attenuation_limit_db", 100),
-                    min_proc_db=nc.get("min_processing_threshold_db", -15),
-                    max_erb_db=nc.get("max_erb_threshold_db", 35),
-                    max_df_db=nc.get("max_df_threshold_db", 35),
-                    post_filter_beta=nc.get("post_filter_beta", 0.0),
-                    target_source=fc_target,
-                    studio_voice=self.studio_enabled,
+                if not stock_plugin_path:
+                    return self._fail_start(
+                        f"LADSPA plugin not found: {DEEPFILTER_SO}"
+                    )
+                started, reason = self._start_filter_chain(
+                    fc_target, stock_plugin_path
                 )
-                conf_path = RUNTIME_DIR / "filter-chain.conf"
-                conf_path.write_text(conf)
-
-                log.info("Spawning filter-chain process")
-                with open(RUNTIME_DIR / "filter-chain.log", "a") as fc_log:
-                    fc_log.write(
-                        "\n--- filter-chain start "
-                        f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
-                    )
-                    fc_log.flush()
-                    self._fc_proc = self._spawn_child(
-                        ["pipewire", "-c", str(conf_path)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=fc_log,
-                    )
-                if self._fc_proc is None:
-                    return self._fail_start("Pipeline shutdown requested")
-                if self._shutdown_pending():
-                    return self._fail_start("Pipeline shutdown requested")
-
-                if not pw_wait_for_node(VIRTUAL_MIC_NAME, timeout=6.0):
-                    stderr = self._read_recent_log("filter-chain")
-                    return self._fail_start(f"Filter-chain failed to start: {stderr}")
-
-                log.info("Filter-chain ready: %s", VIRTUAL_MIC_NAME)
+                if not started:
+                    return self._fail_start(reason)
                 final_node = VIRTUAL_MIC_NAME
 
             # ── Stage 3: Set mic as default + configured output gain ──
@@ -2321,9 +2565,97 @@ class PipelineManager:
 
     # ── Health ──
 
+    def _consume_filter_chain_log(self) -> bool:
+        reader = self._fc_log_reader
+        if reader is None:
+            return False
+        try:
+            # ponytail: truncation is only detected if the file shrank below our
+            # position; ClearVoice never truncates this append-only log.
+            if os.fstat(reader.fileno()).st_size < reader.tell():
+                reader.seek(0)
+                self._fc_log_pending = ""
+                self._fc_stats_previous = None
+            data = reader.read()
+        except (OSError, ValueError):
+            return False
+
+        text = self._fc_log_pending + data.decode(errors="replace")
+        lines = text.splitlines(keepends=True)
+        self._fc_log_pending = ""
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._fc_log_pending = lines.pop()
+
+        fatal_seen = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if line.startswith("clearvoice-ladspa fatal "):
+                self._activate_stock_fallback(line)
+                fatal_seen = True
+                continue
+            stats = _parse_clearvoice_stats(line)
+            if stats is None:
+                continue
+            current = (stats["processed"], stats["concealed"])
+            previous = self._fc_stats_previous
+            self._fc_stats_previous = current
+            if previous is None:
+                continue
+            processed_delta = current[0] - previous[0]
+            concealed_delta = current[1] - previous[1]
+            if processed_delta <= 0 or concealed_delta < 0:
+                continue
+            ratio = concealed_delta / processed_delta
+            now = time.monotonic()
+            if ratio > 0.05 and (
+                self._fc_stats_warning_at is None
+                or now - self._fc_stats_warning_at >= 60
+            ):
+                self._fc_stats_warning_at = now
+                log.warning(
+                    "ClearVoice LADSPA concealment %.1f%% over stats window "
+                    "(concealed=%d processed=%d); model=%s",
+                    ratio * 100,
+                    concealed_delta,
+                    processed_delta,
+                    stats["label"],
+                )
+        return fatal_seen
+
+    def _record_filter_chain_crash(self, pid: int):
+        if self._fc_crash_counted:
+            return
+        self._fc_crash_counted = True
+        now = time.monotonic()
+        self._fc_crash_times = [
+            crashed_at
+            for crashed_at in self._fc_crash_times
+            if now - crashed_at <= 60
+        ]
+        self._fc_crash_times.append(now)
+        if len(self._fc_crash_times) >= 2:
+            self._activate_stock_fallback(
+                f"filter-chain crashed twice within 60 seconds (latest pid={pid})"
+            )
+
     def check_health(self) -> bool:
+        # Never block the GTK thread; a busy lifecycle lock means a stop/start is in
+        # progress, whose intentional terminations must not count as crashes.
+        if not self._lock.acquire(blocking=False):
+            return True
+        try:
+            return self._check_health_locked()
+        finally:
+            self._lock.release()
+
+    def _check_health_locked(self) -> bool:
         if not self._running or self._transitioning:
             return True
+        if (
+            self._fc_model in CLEARVOICE_LADSPA_LABELS
+            and self._consume_filter_chain_log()
+        ):
+            return False
         dead = []
         for attr, name in (
             ("_fc_proc", "filter-chain"),
@@ -2337,6 +2669,11 @@ class PipelineManager:
                     dead.append((name, proc.pid, returncode))
         if dead:
             for name, pid, rc in dead:
+                if (
+                    name == "filter-chain"
+                    and self._fc_model in CLEARVOICE_LADSPA_LABELS
+                ):
+                    self._record_filter_chain_crash(pid)
                 if rc < 0:
                     try:
                         status = f"signal {signal.Signals(-rc).name} ({-rc})"
@@ -2405,6 +2742,8 @@ class PipelineManager:
                         getattr(proc, "pid", "unknown"),
                     )
             setattr(self, attr, None)
+        self._fc_model = None
+        self._close_filter_chain_log()
 
 
 # ── Tray UI ───────────────────────────────────────────────────────────────────
@@ -2530,6 +2869,20 @@ class ClearVoiceTray:
             ri.connect("toggled", self._on_atten, val)
             sub_atten.append(ri)
             grp.append(ri)
+
+        mi_model = Gtk.MenuItem(label="    Noise Model")
+        sub_model = Gtk.Menu()
+        mi_model.set_submenu(sub_model)
+        m.append(mi_model)
+        model_group = []
+        for model, label in NOISE_MODELS.items():
+            ri = Gtk.RadioMenuItem(
+                label=label, group=model_group[0] if model_group else None
+            )
+            ri.set_active(self.pipeline.noise_model == model)
+            ri.connect("toggled", self._on_noise_model, model)
+            sub_model.append(ri)
+            model_group.append(ri)
 
         # Advanced NC tunables
         mi_adv = Gtk.MenuItem(label="    Advanced...")
@@ -2694,6 +3047,7 @@ class ClearVoiceTray:
             return False
         self._update_icon()
         self._update_status()
+        self._show_pending_fallback_notice()
         if not ok:
             log.error("Could not %s ClearVoice", "enable" if enabled else "disable")
             self._show_error(msg)
@@ -2880,6 +3234,14 @@ class ClearVoiceTray:
         if not item.get_active():
             return
         self.config["noise_cancellation"]["attenuation_limit_db"] = val
+        save_config(self.config)
+        if self.pipeline.running:
+            self._async_restart()
+
+    def _on_noise_model(self, item, model):
+        if not item.get_active():
+            return
+        self.config["noise_cancellation"]["model"] = model
         save_config(self.config)
         if self.pipeline.running:
             self._async_restart()
@@ -3098,6 +3460,7 @@ class ClearVoiceTray:
             return False
         self._update_icon()
         self._update_status()
+        self._show_pending_fallback_notice()
         if not ok:
             self._show_error(msg)
             self._mi_enable.set_active(False)
@@ -3155,7 +3518,12 @@ class ClearVoiceTray:
         if self.pipeline.running:
             parts = []
             if self.pipeline.nc_enabled:
-                parts.append("NC")
+                model = NOISE_MODELS.get(
+                    self.pipeline.active_noise_model, NOISE_MODELS["stock"]
+                )
+                if self.pipeline.plugin_fallback_active:
+                    model += " (fallback)"
+                parts.append(f"NC:{model}")
             if self.pipeline.bf_enabled:
                 parts.append("BF")
             if self.pipeline.aec_enabled:
@@ -3169,6 +3537,11 @@ class ClearVoiceTray:
             self._mi_status.set_label(f"{state} [{tag}]")
         else:
             self._mi_status.set_label("Off")
+
+    def _show_pending_fallback_notice(self):
+        message = self.pipeline.take_fallback_notice()
+        if message:
+            self._show_error(message)
 
     def _on_pw_state_change(self, nodes_active: bool):
         """Called when an external app starts or stops consuming the mic."""
