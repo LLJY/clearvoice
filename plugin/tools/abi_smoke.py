@@ -64,9 +64,9 @@ def main():
     enumerate_descriptor.argtypes = [ctypes.c_ulong]
     enumerate_descriptor.restype = ctypes.POINTER(Descriptor)
 
-    descriptors = [enumerate_descriptor(index) for index in range(5)]
-    assert all(descriptors[:4]), "a LADSPA descriptor is missing"
-    assert not descriptors[4], "expected exactly four LADSPA labels"
+    descriptors = [enumerate_descriptor(index) for index in range(6)]
+    assert all(descriptors[:5]), "a LADSPA descriptor is missing"
+    assert not descriptors[5], "expected exactly five LADSPA labels"
 
     descriptor = descriptors[0].contents
     assert descriptor.label == b"clearvoice_dfn3_ll_mono"
@@ -205,8 +205,49 @@ def main():
             descriptor.deactivate(handle)
             descriptor.cleanup(handle)
 
+    descriptor = descriptors[4].contents
+    assert descriptor.label == b"clearvoice_dfn3_ll_int8_mono"
+    assert descriptor.name == b"ClearVoice DeepFilterNet3-LL int8 (constant latency)"
+    assert descriptor.unique_id == 0x00C1EA07
+    assert descriptor.port_count == 9
+    assert [descriptor.port_names[index] for index in range(9)] == names
+    assert [descriptor.port_descriptors[index] for index in range(9)] == ports
+    assert [descriptor.port_range_hints[index].hint_descriptor for index in range(9)] == [
+        hint.hint_descriptor for hint in hints
+    ]
+    handle = descriptor.instantiate(descriptors[4], 48_000)
+    assert handle, "DeepFilterNet3-LL int8 instantiate failed"
+    input_buffer = (ctypes.c_float * 256)()
+    output_buffer = (ctypes.c_float * 256)()
+    latency_ms = ctypes.c_float(35.0)
+    reported_latency = ctypes.c_float(-1.0)
+    controls = [ctypes.c_float(value) for value in (100.0, -15.0, 35.0, 35.0, 0.0)]
+    outputs = []
+    try:
+        descriptor.connect_port(handle, 0, input_buffer)
+        descriptor.connect_port(handle, 1, output_buffer)
+        descriptor.connect_port(handle, 2, ctypes.byref(latency_ms))
+        descriptor.connect_port(handle, 3, ctypes.byref(reported_latency))
+        for index, control in enumerate(controls):
+            descriptor.connect_port(handle, index + 4, ctypes.byref(control))
+        descriptor.activate(handle)
+        assert reported_latency.value == 1680.0, reported_latency.value
+        for block in range(16):
+            for sample_index in range(len(input_buffer)):
+                sample = block * len(input_buffer) + sample_index
+                input_buffer[sample_index] = 0.3 * math.sin(
+                    2.0 * math.pi * 440.0 * sample / 48_000
+                )
+            descriptor.run(handle, len(input_buffer))
+            outputs.extend(output_buffer)
+        assert all(math.isfinite(sample) for sample in outputs)
+        assert any(abs(sample) > 1e-6 for sample in outputs), "int8 output stayed silent"
+    finally:
+        descriptor.deactivate(handle)
+        descriptor.cleanup(handle)
+
     print(
-        "ABI smoke passed: 4 labels (DFN 9 ports, FastEnhancer-B/S/M 4 ports), "
+        "ABI smoke passed: 5 labels (DFN + int8 9 ports, FastEnhancer-B/S/M 4 ports), "
         "44.1 kHz rejected, latency=1680 samples before run, 16 finite sine blocks per label."
     )
 

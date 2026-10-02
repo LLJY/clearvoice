@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use clearvoice_ladspa::Backend;
 use clearvoice_ladspa::backend::dfn::DfnBackend;
+use clearvoice_ladspa::backend::dfn_ort::DfnOrt;
 use clearvoice_ladspa::backend::fastenhancer::FastEnhancer;
 
 const SAMPLE_RATE: usize = 48_000;
@@ -20,19 +21,20 @@ fn run() -> Result<(), String> {
     let backend = args.next();
     if args.next().is_some() {
         return Err(
-            "usage: cv-bench dfn3-ll | fastenhancer-b | fastenhancer-s | fastenhancer-m".to_owned(),
+            "usage: cv-bench dfn3-ll | dfn3-ll-int8 | fastenhancer-b | fastenhancer-s | fastenhancer-m".to_owned(),
         );
     }
     let backend_name = backend.as_deref().unwrap_or("");
     let construction_start = Instant::now();
     let mut backend: Box<dyn Backend> = match backend_name {
         "dfn3-ll" => Box::new(DfnBackend::new()?),
+        "dfn3-ll-int8" => Box::new(DfnOrt::new()?),
         "fastenhancer-b" => Box::new(FastEnhancer::new_b()?),
         "fastenhancer-s" => Box::new(FastEnhancer::new_s()?),
         "fastenhancer-m" => Box::new(FastEnhancer::new_m()?),
         _ => {
             return Err(
-                "usage: cv-bench dfn3-ll | fastenhancer-b | fastenhancer-s | fastenhancer-m"
+                "usage: cv-bench dfn3-ll | dfn3-ll-int8 | fastenhancer-b | fastenhancer-s | fastenhancer-m"
                     .to_owned(),
             );
         }
@@ -89,9 +91,14 @@ fn run() -> Result<(), String> {
         if reset_time > std::time::Duration::from_millis(5) {
             println!("WARNING: reset clone exceeds 5 ms");
         }
-    } else {
+    } else if backend_name.starts_with("fastenhancer-") {
         println!(
             "reset cache zero: {:.3} ms",
+            reset_time.as_secs_f64() * 1000.0
+        );
+    } else {
+        println!(
+            "reset full history: {:.3} ms",
             reset_time.as_secs_f64() * 1000.0
         );
     }
@@ -199,85 +206,100 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_engine_runs_finite_wet_bench_signal_at_quantum_256() {
+    fn dfn_descriptors_run_wet_and_keep_aligned_bypass_at_quantum_256() {
         let _paced = PACED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let signal = synthetic_signal(5);
-        let descriptor_ptr = ladspa::ladspa_descriptor(0);
-        assert!(!descriptor_ptr.is_null());
-        let descriptor = unsafe { &*descriptor_ptr };
-        let instantiate = descriptor.instantiate.expect("instantiate callback");
-        let construct_start = Instant::now();
-        let handle = unsafe { instantiate(descriptor_ptr, SAMPLE_RATE as _) };
-        let ready_time = construct_start.elapsed();
-        assert!(!handle.is_null(), "DFN3-LL instantiate failed");
-        eprintln!(
-            "DFN3-LL descriptor construct-to-ready: {:.3} ms",
-            ready_time.as_secs_f64() * 1000.0
-        );
-        assert!(ready_time < Duration::from_secs(4));
-        let _plugin = PluginHandle {
-            descriptor: descriptor_ptr,
-            handle,
-        };
+        for (descriptor_index, model) in [(0, "DFN3-LL"), (4, "DFN3-LL int8")] {
+            let descriptor_ptr = ladspa::ladspa_descriptor(descriptor_index);
+            assert!(!descriptor_ptr.is_null());
+            let descriptor = unsafe { &*descriptor_ptr };
+            let instantiate = descriptor.instantiate.expect("instantiate callback");
+            let construct_start = Instant::now();
+            let handle = unsafe { instantiate(descriptor_ptr, SAMPLE_RATE as _) };
+            let ready_time = construct_start.elapsed();
+            assert!(!handle.is_null(), "{model} instantiate failed");
+            eprintln!(
+                "{model} descriptor construct-to-ready: {:.3} ms",
+                ready_time.as_secs_f64() * 1000.0
+            );
+            assert!(ready_time < Duration::from_secs(4));
+            let _plugin = PluginHandle {
+                descriptor: descriptor_ptr,
+                handle,
+            };
 
-        let mut latency_ms = 35.0;
-        let mut reported_latency = -1.0;
-        let mut controls = [100.0, -15.0, 35.0, 35.0, 0.0];
-        let mut input_block = [0.0; 256];
-        let mut output_block = [0.0; 256];
-        let mut rendered = vec![0.0; signal.len()];
-        unsafe {
-            let connect = descriptor.connect_port.expect("connect callback");
-            connect(handle, 0, input_block.as_mut_ptr());
-            connect(handle, 1, output_block.as_mut_ptr());
-            connect(handle, 2, &mut latency_ms);
-            connect(handle, 3, &mut reported_latency);
-            for (index, value) in controls.iter_mut().enumerate() {
-                connect(handle, (index + 4) as _, value);
+            let mut latency_ms = 35.0;
+            let mut reported_latency = -1.0;
+            let mut controls = [100.0, -15.0, 35.0, 35.0, 0.0];
+            let mut input_block = [0.0; 256];
+            let mut output_block = [0.0; 256];
+            let mut rendered = vec![0.0; signal.len()];
+            unsafe {
+                let connect = descriptor.connect_port.expect("connect callback");
+                connect(handle, 0, input_block.as_mut_ptr());
+                connect(handle, 1, output_block.as_mut_ptr());
+                connect(handle, 2, &mut latency_ms);
+                connect(handle, 3, &mut reported_latency);
+                for (index, value) in controls.iter_mut().enumerate() {
+                    connect(handle, (index + 4) as _, value);
+                }
+                descriptor.activate.expect("activate callback")(handle);
             }
-            descriptor.activate.expect("activate callback")(handle);
-        }
-        assert_eq!(reported_latency, 1680.0);
+            assert_eq!(reported_latency, 1680.0);
 
-        let run = descriptor.run.expect("run callback");
-        // Real-time pacing, like a PipeWire graph; faster feeding legitimately conceals.
-        let started = Instant::now();
-        for (block_index, samples) in signal.chunks(input_block.len()).enumerate() {
-            let start = block_index * input_block.len();
-            if start == 4 * SAMPLE_RATE {
-                controls[0] = 0.0;
+            let run = descriptor.run.expect("run callback");
+            // Real-time pacing, like a PipeWire graph; faster feeding legitimately conceals.
+            let started = Instant::now();
+            for (block_index, samples) in signal.chunks(input_block.len()).enumerate() {
+                let start = block_index * input_block.len();
+                if start == 4 * SAMPLE_RATE {
+                    controls[0] = 0.0;
+                }
+                input_block[..samples.len()].copy_from_slice(samples);
+                unsafe { run(handle, samples.len() as _) };
+                rendered[start..start + samples.len()]
+                    .copy_from_slice(&output_block[..samples.len()]);
+                let due =
+                    Duration::from_secs_f64((start + samples.len()) as f64 / SAMPLE_RATE as f64);
+                if let Some(wait) = due.checked_sub(started.elapsed()) {
+                    std::thread::sleep(wait);
+                }
             }
-            input_block[..samples.len()].copy_from_slice(samples);
-            unsafe { run(handle, samples.len() as _) };
-            rendered[start..start + samples.len()].copy_from_slice(&output_block[..samples.len()]);
-            let due = Duration::from_secs_f64((start + samples.len()) as f64 / SAMPLE_RATE as f64);
-            if let Some(wait) = due.checked_sub(started.elapsed()) {
-                std::thread::sleep(wait);
-            }
-        }
 
-        assert!(rendered.iter().all(|sample| sample.is_finite()));
-        let mut residual_power = 0.0f64;
-        let mut dry_power = 0.0f64;
-        let wet_end = 4 * SAMPLE_RATE;
-        for index in (2 * SAMPLE_RATE + reported_latency as usize)..wet_end {
-            let dry = signal[index - reported_latency as usize] as f64;
-            let residual = rendered[index] as f64 - dry;
-            residual_power += residual * residual;
-            dry_power += dry * dry;
+            assert!(rendered.iter().all(|sample| sample.is_finite()));
+            let mut residual_power = 0.0f64;
+            let mut dry_power = 0.0f64;
+            let mut output_power = 0.0f64;
+            let wet_end = 4 * SAMPLE_RATE;
+            for index in (2 * SAMPLE_RATE + reported_latency as usize)..wet_end {
+                let dry = signal[index - reported_latency as usize] as f64;
+                let output = rendered[index] as f64;
+                let residual = output - dry;
+                residual_power += residual * residual;
+                dry_power += dry * dry;
+                output_power += output * output;
+            }
+            let wet_ratio = residual_power / dry_power;
+            eprintln!("{model} wet-to-dry residual power ratio after warm-up: {wet_ratio:.6}");
+            assert!(dry_power > 0.0, "{model} test signal has no dry power");
+            assert!(
+                wet_ratio > 1e-6,
+                "{model} engine output remained aligned dry"
+            );
+            assert!(
+                output_power > dry_power * 1e-6,
+                "{model} engine output was muted"
+            );
+            let bypass_start = 4 * SAMPLE_RATE + reported_latency as usize;
+            assert!(
+                rendered[bypass_start..]
+                    .iter()
+                    .zip(&signal[bypass_start - reported_latency as usize..])
+                    .all(|(actual, expected)| actual == expected)
+            );
         }
-        let wet_ratio = residual_power / dry_power;
-        eprintln!("DFN3-LL wet-to-dry residual power ratio after warm-up: {wet_ratio:.6}");
-        assert!(wet_ratio > 1e-6, "engine output remained aligned dry");
-        let bypass_start = 4 * SAMPLE_RATE + reported_latency as usize;
-        assert!(
-            rendered[bypass_start..]
-                .iter()
-                .zip(&signal[bypass_start - reported_latency as usize..])
-                .all(|(actual, expected)| actual == expected)
-        );
     }
 
     #[test]

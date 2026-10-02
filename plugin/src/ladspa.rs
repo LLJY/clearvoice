@@ -235,11 +235,30 @@ static FASTENHANCER_M_DESCRIPTOR: Descriptor = descriptor(
     c"ClearVoice FastEnhancer-M (constant latency)",
 );
 
-static DESCRIPTORS: [&Descriptor; 4] = [
+static DFN_INT8_SPEC: PluginSpec = PluginSpec {
+    label: c"clearvoice_dfn3_ll_int8_mono",
+    factory: crate::backend::dfn_ort::DfnOrt::factory,
+    port_count: 9,
+    port_descriptors: PORT_DESCRIPTORS.as_ptr(),
+    port_names: PORT_NAMES.as_ptr(),
+    port_range_hints: PORT_HINTS.as_ptr(),
+    backend_control_count: 5,
+    control_defaults: &DFN_CONTROL_DEFAULTS,
+    bypass_control: Some(0),
+};
+
+static DFN_INT8_DESCRIPTOR: Descriptor = descriptor(
+    &DFN_INT8_SPEC,
+    0x00C1_EA07,
+    c"ClearVoice DeepFilterNet3-LL int8 (constant latency)",
+);
+
+static DESCRIPTORS: [&Descriptor; 5] = [
     &DFN_DESCRIPTOR,
     &FASTENHANCER_B_DESCRIPTOR,
     &FASTENHANCER_S_DESCRIPTOR,
     &FASTENHANCER_M_DESCRIPTOR,
+    &DFN_INT8_DESCRIPTOR,
 ];
 
 /// LADSPA enumeration entry point.
@@ -505,7 +524,7 @@ mod tests {
         let exported_ptr = ladspa_descriptor(0);
         assert!(!exported_ptr.is_null());
         let exported = unsafe { &*exported_ptr };
-        assert!(ladspa_descriptor(4).is_null());
+        assert!(ladspa_descriptor(5).is_null());
         assert!(ladspa_descriptor(c_ulong::MAX).is_null());
         assert_eq!(exported.unique_id, 0x00C1_EA03);
         assert_eq!(exported.port_count, 9);
@@ -583,6 +602,27 @@ mod tests {
                 [9, 10, 5, 6]
             );
         }
+        let int8_ptr = ladspa_descriptor(4);
+        assert!(!int8_ptr.is_null());
+        let int8 = unsafe { &*int8_ptr };
+        assert_eq!(int8.unique_id, 0x00C1_EA07);
+        assert_eq!(int8.port_count, 9);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(int8.label) }.to_bytes(),
+            b"clearvoice_dfn3_ll_int8_mono"
+        );
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(int8.name) }.to_bytes(),
+            b"ClearVoice DeepFilterNet3-LL int8 (constant latency)"
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(int8.port_descriptors, 9) },
+            [9, 10, 5, 6, 5, 5, 5, 5, 5]
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(int8.port_names, 9) },
+            unsafe { std::slice::from_raw_parts(exported.port_names, 9) }
+        );
         assert_eq!(TEST_DESCRIPTOR.port_count, 4);
         assert_eq!(TEST_DESCRIPTOR.properties, 0);
         assert!(TEST_DESCRIPTOR.run_adding.is_none());

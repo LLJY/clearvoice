@@ -5,6 +5,7 @@ use ort::ep::CPU;
 use ort::session::{Session, builder::GraphOptimizationLevel};
 
 pub mod dfn;
+pub mod dfn_ort;
 pub mod fastenhancer;
 
 pub(crate) fn build_ort_session(model: &str, bytes: &[u8]) -> Result<Session, String> {
