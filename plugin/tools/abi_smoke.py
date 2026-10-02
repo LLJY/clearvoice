@@ -64,9 +64,9 @@ def main():
     enumerate_descriptor.argtypes = [ctypes.c_ulong]
     enumerate_descriptor.restype = ctypes.POINTER(Descriptor)
 
-    descriptors = [enumerate_descriptor(index) for index in range(4)]
-    assert all(descriptors[:3]), "a LADSPA descriptor is missing"
-    assert not descriptors[3], "expected exactly three LADSPA labels"
+    descriptors = [enumerate_descriptor(index) for index in range(5)]
+    assert all(descriptors[:4]), "a LADSPA descriptor is missing"
+    assert not descriptors[4], "expected exactly four LADSPA labels"
 
     descriptor = descriptors[0].contents
     assert descriptor.label == b"clearvoice_dfn3_ll_mono"
@@ -154,6 +154,11 @@ def main():
                 b"ClearVoice FastEnhancer-S (constant latency)",
                 0x00C1EA05,
             ),
+            (
+                b"clearvoice_fastenhancer_m_mono",
+                b"ClearVoice FastEnhancer-M (constant latency)",
+                0x00C1EA06,
+            ),
         ],
         start=1,
     ):
@@ -201,7 +206,7 @@ def main():
             descriptor.cleanup(handle)
 
     print(
-        "ABI smoke passed: 3 labels (DFN 9 ports, FastEnhancer-B/S 4 ports), "
+        "ABI smoke passed: 4 labels (DFN 9 ports, FastEnhancer-B/S/M 4 ports), "
         "44.1 kHz rejected, latency=1680 samples before run, 16 finite sine blocks per label."
     )
 

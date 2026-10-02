@@ -11,6 +11,7 @@ REVISION_FILE="$DEST.revision"
 RELEASE_API="https://api.github.com/repos/aask1357/fastenhancer/releases/tags/onnx-48khz-v1"
 FASTENHANCER_B_SHA256=70e23bba3d41e80d30ebc5eba39d9df64f0e0315f31c772022bb17576c4d96bf
 FASTENHANCER_S_SHA256=f04ece2beed330da367264c54cedded62f65a117fbde5c005d3a88fc796d0ba3
+FASTENHANCER_M_SHA256=c7da800810b583f4734d757c6e14d235f3eec81476121b595743e5866b66efa2
 RELEASE_JSON=""
 TEMP_FILES=()
 
@@ -80,6 +81,7 @@ ensure_model() {
 mkdir -p "$MODEL_DIR"
 ensure_model fastenhancer_b.onnx "$FASTENHANCER_B_SHA256"
 ensure_model fastenhancer_s.onnx "$FASTENHANCER_S_SHA256"
+ensure_model fastenhancer_m.onnx "$FASTENHANCER_M_SHA256"
 
 (cd "$PLUGIN_DIR" && cargo build --release --locked --target-dir "$PLUGIN_DIR/target")
 

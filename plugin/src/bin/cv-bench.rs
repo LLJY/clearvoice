@@ -1,10 +1,8 @@
 use std::time::Instant;
 
 use clearvoice_ladspa::Backend;
-use clearvoice_ladspa::backend::dfn::{DfnBackend, HOP as DFN_HOP};
-use clearvoice_ladspa::backend::fastenhancer::{
-    DELAY as FE_DELAY, FastEnhancer, HOP as FE_HOP, SETTLE_FRAMES as FE_SETTLE_FRAMES,
-};
+use clearvoice_ladspa::backend::dfn::DfnBackend;
+use clearvoice_ladspa::backend::fastenhancer::FastEnhancer;
 
 const SAMPLE_RATE: usize = 48_000;
 const DURATION_SECONDS: usize = 60;
@@ -21,31 +19,27 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let backend = args.next();
     if args.next().is_some() {
-        return Err("usage: cv-bench dfn3-ll | fastenhancer-b | fastenhancer-s".to_owned());
+        return Err(
+            "usage: cv-bench dfn3-ll | fastenhancer-b | fastenhancer-s | fastenhancer-m".to_owned(),
+        );
     }
     let backend_name = backend.as_deref().unwrap_or("");
     let construction_start = Instant::now();
-    let (mut backend, hop, delay, settle_frames) = match backend_name {
-        "dfn3-ll" => (
-            Box::new(DfnBackend::new()?) as Box<dyn Backend>,
-            DFN_HOP,
-            clearvoice_ladspa::backend::dfn::DELAY,
-            clearvoice_ladspa::backend::dfn::SETTLE_FRAMES,
-        ),
-        "fastenhancer-b" => (
-            Box::new(FastEnhancer::new_b()?) as Box<dyn Backend>,
-            FE_HOP,
-            FE_DELAY,
-            FE_SETTLE_FRAMES,
-        ),
-        "fastenhancer-s" => (
-            Box::new(FastEnhancer::new_s()?) as Box<dyn Backend>,
-            FE_HOP,
-            FE_DELAY,
-            FE_SETTLE_FRAMES,
-        ),
-        _ => return Err("usage: cv-bench dfn3-ll | fastenhancer-b | fastenhancer-s".to_owned()),
+    let mut backend: Box<dyn Backend> = match backend_name {
+        "dfn3-ll" => Box::new(DfnBackend::new()?),
+        "fastenhancer-b" => Box::new(FastEnhancer::new_b()?),
+        "fastenhancer-s" => Box::new(FastEnhancer::new_s()?),
+        "fastenhancer-m" => Box::new(FastEnhancer::new_m()?),
+        _ => {
+            return Err(
+                "usage: cv-bench dfn3-ll | fastenhancer-b | fastenhancer-s | fastenhancer-m"
+                    .to_owned(),
+            );
+        }
     };
+    let hop = backend.hop();
+    let delay = backend.delay();
+    let settle_frames = backend.settle_frames();
     let mut warm_output = vec![0.0; hop];
     backend.process(&vec![0.0; hop], &mut warm_output)?;
     let reset_start = Instant::now();
@@ -292,7 +286,11 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let signal = synthetic_signal(2);
-        for (index, model) in [(1, "FastEnhancer-B"), (2, "FastEnhancer-S")] {
+        for (index, model, expected_hop, expected_delay) in [
+            (1, "FastEnhancer-B", 512, 512),
+            (2, "FastEnhancer-S", 512, 512),
+            (3, "FastEnhancer-M", 320, 704),
+        ] {
             let descriptor_ptr = ladspa::ladspa_descriptor(index);
             assert!(!descriptor_ptr.is_null());
             let descriptor = unsafe { &*descriptor_ptr };
@@ -318,13 +316,19 @@ mod tests {
             let mut reference_backend = match index {
                 1 => FastEnhancer::new_b().expect("FastEnhancer-B reference backend"),
                 2 => FastEnhancer::new_s().expect("FastEnhancer-S reference backend"),
+                3 => FastEnhancer::new_m().expect("FastEnhancer-M reference backend"),
                 _ => unreachable!(),
             };
             reference_backend.reset();
+            let hop = reference_backend.hop();
+            let delay = reference_backend.delay();
+            assert_eq!(hop, expected_hop, "{model} hop");
+            assert_eq!(delay, expected_delay, "{model} delay");
             let mut reference = vec![0.0; signal.len()];
-            let (source_frames, _) = signal.as_chunks::<FE_HOP>();
-            let (reference_frames, _) = reference.as_chunks_mut::<FE_HOP>();
-            for (source, target) in source_frames.iter().zip(reference_frames) {
+            for (source, target) in signal
+                .chunks_exact(hop)
+                .zip(reference.chunks_exact_mut(hop))
+            {
                 reference_backend
                     .process(source, target)
                     .expect("FastEnhancer reference frame");
@@ -362,10 +366,10 @@ mod tests {
 
             assert!(rendered.iter().all(|sample| sample.is_finite()));
             let latency = reported_latency as usize;
-            let alignment = latency - FE_DELAY;
-            assert_eq!(alignment, 1_168);
-            // Frame 1 is the first whose aligned dry input exists (frame 0 settles dry).
-            let first_frame = 1;
+            let alignment = latency - delay;
+            assert_eq!(alignment, 1680 - expected_delay);
+            // Skip settling plus any frames whose aligned dry input precedes sample zero.
+            let first_frame = reference_backend.settle_frames().max(delay.div_ceil(hop));
             let mut compared_frames = 0;
             let mut reference_frames = 0;
             let mut output_energy = 0.0f64;
@@ -375,17 +379,15 @@ mod tests {
                 if diverged {
                     break;
                 }
-                let output_start = alignment + frame * FE_HOP;
-                let reference_start = frame * FE_HOP;
-                if output_start + FE_HOP > rendered.len()
-                    || reference_start + FE_HOP > reference.len()
-                {
+                let output_start = alignment + frame * hop;
+                let reference_start = frame * hop;
+                if output_start + hop > rendered.len() || reference_start + hop > reference.len() {
                     break;
                 }
-                let actual = &rendered[output_start..output_start + FE_HOP];
-                let expected = &reference[reference_start..reference_start + FE_HOP];
+                let actual = &rendered[output_start..output_start + hop];
+                let expected = &reference[reference_start..reference_start + hop];
                 let dry_start = output_start - latency;
-                let dry = &signal[dry_start..dry_start + FE_HOP];
+                let dry = &signal[dry_start..dry_start + hop];
                 let matches_reference = actual
                     .iter()
                     .zip(expected)

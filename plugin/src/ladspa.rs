@@ -217,10 +217,29 @@ static FASTENHANCER_S_DESCRIPTOR: Descriptor = descriptor(
     c"ClearVoice FastEnhancer-S (constant latency)",
 );
 
-static DESCRIPTORS: [&Descriptor; 3] = [
+static FASTENHANCER_M_SPEC: PluginSpec = PluginSpec {
+    label: c"clearvoice_fastenhancer_m_mono",
+    factory: crate::backend::fastenhancer::FastEnhancer::factory_m,
+    port_count: 4,
+    port_descriptors: PORT_DESCRIPTORS.as_ptr(),
+    port_names: PORT_NAMES.as_ptr(),
+    port_range_hints: PORT_HINTS.as_ptr(),
+    backend_control_count: 0,
+    control_defaults: &[],
+    bypass_control: None,
+};
+
+static FASTENHANCER_M_DESCRIPTOR: Descriptor = descriptor(
+    &FASTENHANCER_M_SPEC,
+    0x00C1_EA06,
+    c"ClearVoice FastEnhancer-M (constant latency)",
+);
+
+static DESCRIPTORS: [&Descriptor; 4] = [
     &DFN_DESCRIPTOR,
     &FASTENHANCER_B_DESCRIPTOR,
     &FASTENHANCER_S_DESCRIPTOR,
+    &FASTENHANCER_M_DESCRIPTOR,
 ];
 
 /// LADSPA enumeration entry point.
@@ -486,7 +505,7 @@ mod tests {
         let exported_ptr = ladspa_descriptor(0);
         assert!(!exported_ptr.is_null());
         let exported = unsafe { &*exported_ptr };
-        assert!(ladspa_descriptor(3).is_null());
+        assert!(ladspa_descriptor(4).is_null());
         assert!(ladspa_descriptor(c_ulong::MAX).is_null());
         assert_eq!(exported.unique_id, 0x00C1_EA03);
         assert_eq!(exported.port_count, 9);
@@ -538,6 +557,12 @@ mod tests {
                 0x00C1_EA05,
                 b"clearvoice_fastenhancer_s_mono".as_slice(),
                 b"ClearVoice FastEnhancer-S (constant latency)".as_slice(),
+            ),
+            (
+                3usize,
+                0x00C1_EA06,
+                b"clearvoice_fastenhancer_m_mono".as_slice(),
+                b"ClearVoice FastEnhancer-M (constant latency)".as_slice(),
             ),
         ] {
             let descriptor_ptr = ladspa_descriptor(index as c_ulong);
