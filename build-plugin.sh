@@ -12,6 +12,22 @@ RELEASE_API="https://api.github.com/repos/aask1357/fastenhancer/releases/tags/on
 FASTENHANCER_B_SHA256=70e23bba3d41e80d30ebc5eba39d9df64f0e0315f31c772022bb17576c4d96bf
 FASTENHANCER_S_SHA256=f04ece2beed330da367264c54cedded62f65a117fbde5c005d3a88fc796d0ba3
 FASTENHANCER_M_SHA256=c7da800810b583f4734d757c6e14d235f3eec81476121b595743e5866b66efa2
+DFN3_LL_MODELS=(
+    dfn3_ll_fp32_enc.onnx
+    dfn3_ll_fp32_erb_dec.onnx
+    dfn3_ll_fp32_df_dec.onnx
+    dfn3_ll_int8_enc.onnx
+    dfn3_ll_int8_erb_dec.onnx
+    dfn3_ll_int8_df_dec.onnx
+)
+DFN3_LL_SHA256=(
+    fe117b6c086cb2c9d36c87173b6396587c4453d5a66334d57c61c6202226a051
+    7a92b0985210eeb6dd8cee38d165f44164b2f81b8ae47e37f99d11e9dd5f4051
+    9cb30842cc29a5d19e4e07b10c19437da85e50612f2527f00ab716b77f9ec1db
+    737ad59aa3c2cf48e93b4e7d38ea56aa4fdd4d7565414d6919774e073e14d5b4
+    deadfe770f1581e6b2f1af9850bcb87437c26dee5feb7ffe744824cc961b189d
+    6091e62c32664da4eee2be95f58e7ca0562bd4dfe37350b54a743ca1a867cf7a
+)
 RELEASE_JSON=""
 TEMP_FILES=()
 
@@ -78,10 +94,38 @@ ensure_model() {
     echo "Fetched verified model: $destination"
 }
 
+ensure_dfn3_ll_models() {
+    local needs_export=false index file
+    for index in "${!DFN3_LL_MODELS[@]}"; do
+        file="$MODEL_DIR/${DFN3_LL_MODELS[$index]}"
+        if [[ ! -f "$file" ]] || ! printf '%s  %s\n' "${DFN3_LL_SHA256[$index]}" "$file" | sha256sum --check --status; then
+            needs_export=true
+        fi
+    done
+
+    if [[ "$needs_export" == true ]]; then
+        command -v uv &>/dev/null || {
+            echo "Missing build command: uv (required to regenerate DFN3-LL models)" >&2
+            return 1
+        }
+        echo "DFN3-LL models missing or changed; regenerating pinned exports."
+        uv run --script "$PLUGIN_DIR/tools/dfn_export.py" --out "$MODEL_DIR"
+    fi
+
+    for index in "${!DFN3_LL_MODELS[@]}"; do
+        file="$MODEL_DIR/${DFN3_LL_MODELS[$index]}"
+        if ! verify_model "$file" "${DFN3_LL_SHA256[$index]}"; then
+            echo "DFN3-LL generator output changed — re-pin only after re-validating." >&2
+            return 1
+        fi
+    done
+}
+
 mkdir -p "$MODEL_DIR"
 ensure_model fastenhancer_b.onnx "$FASTENHANCER_B_SHA256"
 ensure_model fastenhancer_s.onnx "$FASTENHANCER_S_SHA256"
 ensure_model fastenhancer_m.onnx "$FASTENHANCER_M_SHA256"
+ensure_dfn3_ll_models
 
 (cd "$PLUGIN_DIR" && cargo build --release --locked --target-dir "$PLUGIN_DIR/target")
 
