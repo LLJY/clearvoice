@@ -57,7 +57,7 @@ PIDFILE = RUNTIME_DIR / "clearvoice.pid"
 PRIVATE_SPA_ROOT = Path.home() / ".local/lib/clearvoice/spa-0.2"
 PRIVATE_AEC_PLUGIN = PRIVATE_SPA_ROOT / "aec/libspa-aec-webrtc.so"
 SYSTEM_SPA_ROOT = Path("/usr/lib/spa-0.2")
-REQUIRED_PIPEWIRE_VERSION = "1.6.8"
+REQUIRED_PIPEWIRE_VERSION = "1.6.9"
 DEEPFILTER_RT_PRIORITY = 10
 
 # PipeWire node names

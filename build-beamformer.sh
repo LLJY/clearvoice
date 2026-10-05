@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PIPEWIRE_VERSION=1.6.8
-PIPEWIRE_COMMIT=b741e0c74f5436f0c925f7741140db0efd32cf4e
+PIPEWIRE_VERSION=1.6.9
+PIPEWIRE_COMMIT=8fa27cabdc6c0c1350c69c026af5850ef0af1e26
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/clearvoice/pipewire-$PIPEWIRE_VERSION-legacy"
 SOURCE_DIR="$CACHE_DIR/source"
 BUILD_DIR="$CACHE_DIR/build"
