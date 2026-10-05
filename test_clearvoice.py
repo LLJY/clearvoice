@@ -1091,6 +1091,55 @@ def test_beamforming_preflight_failure_fails_open_without_changing_preferences()
     start_playback.assert_not_called()
 
 
+def test_beamforming_accepts_pipewire_point_releases_only_within_series():
+    config = _config()
+    config["noise_cancellation"]["enabled"] = False
+    config["speaker_enhancement"]["enabled"] = False
+    config["beamforming"]["enabled"] = True
+    config["source_device"] = "mic"
+    cases = {
+        ("1.6.9", "1.6.9"): True,
+        ("1.6.10", "1.6.12"): True,
+        ("1.7.0", "1.7.0"): False,
+        ("1.60.1", "1.60.1"): False,
+        ("1.6.9", "1.7.0"): False,
+        (None, None): False,
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        plugin = Path(directory) / "libspa-aec-webrtc.so"
+        plugin.write_bytes(b"")
+        for versions, accepted in cases.items():
+            manager = clearvoice.PipelineManager(copy.deepcopy(config))
+            manager._started_once = True
+            with (
+                patch.object(clearvoice, "PRIVATE_AEC_PLUGIN", plugin),
+                patch.object(clearvoice, "pw_pipewire_versions", return_value=versions),
+                # Stop right after the version gate when it passes.
+                patch.object(clearvoice, "pw_source_has_separate_fl_fr", return_value=False),
+                patch.object(
+                    clearvoice,
+                    "pw_list_sources",
+                    return_value=[{"name": "mic", "id": 1, "description": "Mic"}],
+                ),
+                patch.object(clearvoice, "pactl_list_sinks", return_value=[]),
+                patch.object(clearvoice, "pw_get_default_sink", return_value="sink"),
+                patch.object(
+                    clearvoice,
+                    "pw_get_sink_active_port",
+                    return_value="analog-output-speaker",
+                ),
+                patch.object(clearvoice, "wp_set_setting", return_value=True),
+                patch.object(clearvoice, "save_config"),
+                patch.object(manager, "_kill_all"),
+                patch.object(manager, "_restore_previous_defaults"),
+                patch.object(manager, "_start_playback_output"),
+            ):
+                ok, msg = manager.start()
+            assert not ok
+            expected = "separate FL and FR" if accepted else "requires PipeWire"
+            assert expected in msg, (versions, msg)
+
+
 def test_active_port_detection_handles_missing_and_malformed_data():
     result = Mock(returncode=0, stderr="")
     result.stdout = json.dumps(

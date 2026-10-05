@@ -57,7 +57,7 @@ PIDFILE = RUNTIME_DIR / "clearvoice.pid"
 PRIVATE_SPA_ROOT = Path.home() / ".local/lib/clearvoice/spa-0.2"
 PRIVATE_AEC_PLUGIN = PRIVATE_SPA_ROOT / "aec/libspa-aec-webrtc.so"
 SYSTEM_SPA_ROOT = Path("/usr/lib/spa-0.2")
-REQUIRED_PIPEWIRE_VERSION = "1.6.9"
+REQUIRED_PIPEWIRE_SERIES = "1.6"
 DEEPFILTER_RT_PRIORITY = 10
 
 # PipeWire node names
@@ -2331,13 +2331,12 @@ class PipelineManager:
                     f"Private beamformer plugin not found: {PRIVATE_AEC_PLUGIN}"
                 )
             compiled, linked = pw_pipewire_versions()
-            if (compiled, linked) != (
-                REQUIRED_PIPEWIRE_VERSION,
-                REQUIRED_PIPEWIRE_VERSION,
-            ):
+            # Point releases keep the SPA AEC interface; rebuild per major.minor series.
+            series = {".".join((v or "").split(".")[:2]) for v in (compiled, linked)}
+            if series != {REQUIRED_PIPEWIRE_SERIES}:
                 return self._fail_start(
                     "Beamforming requires PipeWire compiled and linked with "
-                    f"{REQUIRED_PIPEWIRE_VERSION} (got {compiled or 'unknown'}/"
+                    f"{REQUIRED_PIPEWIRE_SERIES}.x (got {compiled or 'unknown'}/"
                     f"{linked or 'unknown'})"
                 )
             try:

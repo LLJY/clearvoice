@@ -22,8 +22,10 @@ if [[ "$(pkg-config --modversion webrtc-audio-processing 2>/dev/null || true)" !
     exit 1
 fi
 
-if ! pipewire --version | grep -q " $PIPEWIRE_VERSION$"; then
-    echo "This build is pinned to PipeWire $PIPEWIRE_VERSION." >&2
+# Point releases keep the SPA AEC interface; only a new major.minor series needs a new pin.
+PIPEWIRE_SERIES=${PIPEWIRE_VERSION%.*}
+if ! pipewire --version | grep -q " ${PIPEWIRE_SERIES//./\\.}\.[0-9]*$"; then
+    echo "This build is pinned to PipeWire $PIPEWIRE_SERIES.x (source $PIPEWIRE_VERSION)." >&2
     exit 1
 fi
 
