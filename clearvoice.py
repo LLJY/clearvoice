@@ -100,6 +100,8 @@ LADSPA_SEARCH_PATHS = [
 SPEAKER_CHAIN_CONF = Path(__file__).parent / "speaker-chain.conf"
 SPEAKER_SINK_NAME = "clearvoice_speakers"
 ORPHAN_PROCESS_PATTERN = r"^pipewire -c .*/clearvoice/"
+# Coalesce bursts of graph events (Bluetooth connects emit several) into one route probe.
+ROUTE_EVENT_DEBOUNCE_MS = 150
 
 # Icons (3 states)
 ICON_ACTIVE = "audio-input-microphone-high"  # full bars — processing audio
@@ -286,6 +288,64 @@ def pw_dump_objects(manager: bool = False) -> list[dict] | None:
         return None
 
 
+def pw_dump_matching(pattern: str, manager: bool = False) -> list[dict] | None:
+    """Return objects whose name or path fnmatch-es *pattern* (pw-dump's own filter).
+
+    About half the cost of a full dump. Callers still compare exact properties.
+    """
+    try:
+        result = subprocess.run(
+            ["pw-dump", pattern],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=(
+                {**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"}
+                if manager
+                else None
+            ),
+        )
+        if result.returncode != 0:
+            return None
+        if not result.stdout.strip():
+            return []  # pw-dump prints nothing when no object matches
+        objects = json.loads(result.stdout)
+        return objects if isinstance(objects, list) else None
+    except Exception as exc:
+        log.error("Failed to query PipeWire objects matching %s: %s", pattern, exc)
+        return None
+
+
+def pw_dump_named(name: str, manager: bool = False) -> list[dict] | None:
+    """Return objects for one node name; names with glob characters get a full dump."""
+    if any(char in name for char in "*?[("):
+        return pw_dump_objects(manager)
+    return pw_dump_matching(name, manager)
+
+
+def _node_names(objects: list[dict]) -> set[str]:
+    return {
+        str(((obj.get("info") or {}).get("props") or {}).get("node.name"))
+        for obj in objects
+        if isinstance(obj, dict) and obj.get("type") == "PipeWire:Interface:Node"
+    }
+
+
+def pw_wait_for_nodes_gone(prefix: str, timeout: float = 1.0) -> bool:
+    """Wait until no node named *prefix*... exists (exited children may linger briefly)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        objects = pw_dump_matching(f"{prefix}*")
+        if objects is not None and not any(
+            name.startswith(prefix) for name in _node_names(objects)
+        ):
+            return True
+        if time.monotonic() >= deadline:
+            log.warning("PipeWire nodes %s* still present after %.1f s", prefix, timeout)
+            return False
+        time.sleep(0.02)
+
+
 def _pw_output_ports(objects: list[dict], node_id: int) -> list[dict]:
     """Return output port properties for one PipeWire node."""
     ports = []
@@ -392,7 +452,7 @@ def pw_wait_for_beamformed_source(
     while time.monotonic() < deadline:
         objects = pw_dump_objects(manager=True)
         if objects is None:
-            time.sleep(0.1)
+            time.sleep(0.05)
             continue
         clients = [
             obj
@@ -414,7 +474,7 @@ def pw_wait_for_beamformed_source(
             props = nodes[0].get("info", {}).get("props", {})
             if len(clients) != 1:
                 reason = "beamformer process client did not appear"
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
             if str(props.get("client.id")) != str(clients[0]["id"]):
                 return False, "beamformer source is not owned by its echo-cancel process"
@@ -422,7 +482,7 @@ def pw_wait_for_beamformed_source(
             if len(ports) == 1 and ports[0].get("audio.channel") == "MONO":
                 return True, ""
             reason = "beamformer source did not expose exactly one MONO output port"
-        time.sleep(0.1)
+        time.sleep(0.05)
     return False, reason
 
 
@@ -639,28 +699,15 @@ def pw_set_default_sink(node_id: int) -> bool:
 
 def pw_find_node_id(node_name: str, manager: bool = False) -> int | None:
     """Find a PipeWire node ID by node.name."""
-    try:
-        r = subprocess.run(
-            ["pw-dump"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=(
-                {**os.environ, "PIPEWIRE_REMOTE": "pipewire-0-manager"}
-                if manager
-                else None
-            ),
-        )
-        if r.returncode != 0:
-            return None
-        for obj in json.loads(r.stdout):
-            props = obj.get("info", {}).get("props", {})
-            if props.get("node.name") == node_name:
-                if props.get("media.class") in ("Audio/Sink", "Audio/Source"):
-                    return obj["id"]
-        return None
-    except Exception:
-        return None
+    for obj in pw_dump_named(node_name, manager) or []:
+        props = (obj.get("info") or {}).get("props") or {}
+        if (
+            obj.get("type") == "PipeWire:Interface:Node"
+            and props.get("node.name") == node_name
+            and props.get("media.class") in ("Audio/Sink", "Audio/Source")
+        ):
+            return obj["id"]
+    return None
 
 
 def pw_set_node_volume(node_name: str, percent: int) -> bool:
@@ -712,14 +759,16 @@ class PipeWireMonitor:
     appears or disappears. Zero CPU when nothing changes.
     """
 
-    def __init__(self, on_state_change: callable, on_link_removed=None):
+    def __init__(self, on_state_change: callable, on_link_removed=None, on_route_change=None):
         self.on_state_change = on_state_change
         self.on_link_removed = on_link_removed
+        self.on_route_change = on_route_change
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._active = False
         self._enabled = False
         self._objects: dict[int, dict] = {}
+        self._route_signature: frozenset | None = None
 
     @property
     def nodes_active(self) -> bool:
@@ -845,6 +894,42 @@ class PipeWireMonitor:
         if now_active != self._active:
             self._active = now_active
             GLib.idle_add(self.on_state_change, now_active)
+
+        route_signature = _route_signature(self._objects.values())
+        if (
+            self.on_route_change
+            and self._route_signature is not None
+            and route_signature != self._route_signature
+        ):
+            GLib.idle_add(self.on_route_change)
+        self._route_signature = route_signature
+
+
+def _route_signature(objects) -> frozenset:
+    """What decides the output route: physical sinks plus device routes and profiles.
+
+    Volumes live in Route props and are left out, so volume changes do not count.
+    """
+    items = set()
+    for obj in objects:
+        info = obj.get("info") or {}
+        props = info.get("props") or {}
+        if obj.get("type") == "PipeWire:Interface:Device":
+            params = info.get("params") or {}
+
+            def entries(key):
+                return tuple(sorted(
+                    (str(entry.get("name")), str(entry.get("available")))
+                    for entry in params.get(key) or []
+                    if isinstance(entry, dict)
+                ))
+
+            items.add(("device", props.get("device.name"), entries("Route"), entries("EnumProfile")))
+        elif obj.get("type") == "PipeWire:Interface:Node" and props.get("media.class") == "Audio/Sink":
+            name = props.get("node.name")
+            if isinstance(name, str) and not name.startswith("clearvoice"):
+                items.add(("sink", name))
+    return frozenset(items)
 
 
 def pw_link_ports(output_port: str, input_port: str, connect: bool) -> bool:
@@ -1168,17 +1253,7 @@ def pw_set_default_source(name: str) -> bool:
 
 
 def pw_node_exists(node_name: str) -> bool:
-    try:
-        r = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5)
-        if r.returncode != 0:
-            return False
-        for obj in json.loads(r.stdout):
-            props = obj.get("info", {}).get("props", {})
-            if props.get("node.name") == node_name:
-                return True
-        return False
-    except Exception:
-        return False
+    return node_name in _node_names(pw_dump_named(node_name) or [])
 
 
 def pw_wait_for_node(node_name: str, timeout: float = 5.0) -> bool:
@@ -1186,7 +1261,7 @@ def pw_wait_for_node(node_name: str, timeout: float = 5.0) -> bool:
     while time.monotonic() < deadline:
         if pw_node_exists(node_name):
             return True
-        time.sleep(0.25)
+        time.sleep(0.05)
     return False
 
 
@@ -2259,7 +2334,7 @@ class PipelineManager:
                 return False
             if pw_node_exists(VIRTUAL_MIC_NAME):
                 return proc.poll() is None
-            time.sleep(0.25)
+            time.sleep(0.05)
         return False
 
     def _stop_filter_chain_attempt(self):
@@ -2557,7 +2632,6 @@ class PipelineManager:
 
             # ── Stage 3: Set mic as default + configured output gain ──
             if needs_mic:
-                time.sleep(0.3)
                 output_gain = (
                     100
                     if self.config["lock_output_volume"]
@@ -2570,6 +2644,8 @@ class PipelineManager:
                     )
                 if self.config["lock_base_mic_audio"] and not output_gain_ready:
                     return self._fail_start("Could not prepare ClearVoice output gain lock")
+            else:
+                self._restore_previous_default_source()
 
             lock_state = self.config["lock_base_mic_audio"] if needs_mic else False
             if not self._publish_lock_state(lock_state):
@@ -2591,7 +2667,7 @@ class PipelineManager:
         with self._lock:
             return self._stop_locked()
 
-    def _stop_locked(self) -> tuple[bool, str]:
+    def _stop_locked(self, restore_defaults: bool = True) -> tuple[bool, str]:
         if not self._running:
             return True, "Already stopped"
 
@@ -2603,7 +2679,8 @@ class PipelineManager:
         self._publish_lock_state(False)
         self._publish_output_volume_lock(False)
         self._kill_all()
-        self._restore_previous_defaults()
+        if restore_defaults:
+            self._restore_previous_defaults()
         self._base_mic_node = None
         self._playback_sink = None
         self._running = False
@@ -2621,10 +2698,13 @@ class PipelineManager:
         self._playback_sink = None
         return False, msg
 
-    def _restore_previous_defaults(self):
+    def _restore_previous_default_source(self):
         prev = self.config.get("previous_default_source")
         if prev:
             pw_set_default_source(prev)
+
+    def _restore_previous_defaults(self):
+        self._restore_previous_default_source()
 
         prev_sink = self.config.get("previous_default_sink")
         # Keep a connected Bluetooth headset selected instead of moving playback to the speakers.
@@ -2642,8 +2722,11 @@ class PipelineManager:
                 return False, "Pipeline shutdown requested"
             self._transitioning = True
             try:
-                self._stop_locked()
-                time.sleep(0.5)
+                # Keep ClearVoice as the configured default so apps return to the new
+                # virtual mic as soon as it appears; a graph without one restores the
+                # mic default in _start_locked, with the config that start actually reads.
+                self._stop_locked(restore_defaults=False)
+                pw_wait_for_nodes_gone("clearvoice_")
                 result = (
                     (False, "Pipeline shutdown requested")
                     if self._shutdown_pending()
@@ -2654,9 +2737,65 @@ class PipelineManager:
                 result = self._fail_start(str(exc))
             finally:
                 self._transitioning = False
+            if not result[0]:
+                # Early start exits and shutdown skip _fail_start; restoring twice is harmless.
+                self._restore_previous_defaults()
         if result[0]:
             self._request_mic_reconcile()
         return result
+
+    def restart_filter_chain(self) -> tuple[bool, str]:
+        """Relaunch only the noise filter; echo-cancel and the speaker chain stay up.
+
+        Falls back to a full restart when the filter-chain is not part of the running graph.
+        """
+        if self._shutdown_pending():
+            return False, "Pipeline shutdown requested"
+        with self._lock:
+            if self._shutdown_pending():
+                return False, "Pipeline shutdown requested"
+            scoped = (
+                self._running
+                and self.nc_enabled
+                and self._base_mic_node is not None
+                and self._fc_proc is not None
+            )
+            if scoped:
+                self._transitioning = True
+                self._generation += 1  # cancels reconcile/promotion of the old process
+                try:
+                    result = self._relaunch_filter_chain_locked()
+                except Exception as exc:
+                    log.exception("Filter-chain restart failed")
+                    result = self._fail_start(str(exc))
+                finally:
+                    self._transitioning = False
+        if not scoped:
+            return self.restart()
+        if result[0]:
+            self._request_mic_reconcile()
+        return result
+
+    def _relaunch_filter_chain_locked(self) -> tuple[bool, str]:
+        log.info("Restarting filter-chain only")
+        self._stop_filter_chain_attempt()
+        pw_wait_for_nodes_gone(VIRTUAL_MIC_NAME)
+        pw_wait_for_nodes_gone("clearvoice_capture")
+        stock_plugin_path = find_ladspa_plugin(DEEPFILTER_SO)
+        if not stock_plugin_path:
+            return self._fail_start(f"LADSPA plugin not found: {DEEPFILTER_SO}")
+        target = EC_SOURCE_NAME if self.ec_needed else self._base_mic_node
+        started, reason = self._start_filter_chain(target, stock_plugin_path)
+        if not started:
+            return self._fail_start(reason)
+        output_gain_ready = self.set_output_gain(
+            100 if self.config["lock_output_volume"] else self.config["output_gain_percent"]
+        )
+        if not pw_set_default_source(VIRTUAL_MIC_NAME):
+            return self._fail_start(f"Could not set default source to {VIRTUAL_MIC_NAME}")
+        if self.config["lock_base_mic_audio"] and not output_gain_ready:
+            return self._fail_start("Could not prepare ClearVoice output gain lock")
+        return True, "Filter-chain restarted"
 
     # ── Health ──
 
@@ -2853,6 +2992,7 @@ class ClearVoiceTray:
         self._pw_monitor: PipeWireMonitor | None = None
         self._route_probe_pending = False
         self._route_restart_pending = False
+        self._route_event_pending = False
         self._health_restart_pending = False
         self._quitting = False
         self._enable_converge_lock = threading.Lock()
@@ -2890,6 +3030,7 @@ class ClearVoiceTray:
         self._pw_monitor = PipeWireMonitor(
             on_state_change=self._on_pw_state_change,
             on_link_removed=self.pipeline._request_mic_reconcile,
+            on_route_change=self._on_route_event,
         )
         self._pw_monitor.start()
 
@@ -3323,7 +3464,7 @@ class ClearVoiceTray:
         self.config["studio_voice"]["enabled"] = item.get_active()
         save_config(self.config)
         if self.pipeline.running:
-            self._async_restart()
+            self._async_restart(filter_only=True)
 
     def _on_atten(self, item, val):
         if not item.get_active():
@@ -3331,7 +3472,7 @@ class ClearVoiceTray:
         self.config["noise_cancellation"]["attenuation_limit_db"] = val
         save_config(self.config)
         if self.pipeline.running:
-            self._async_restart()
+            self._async_restart(filter_only=True)
 
     def _on_noise_model(self, item, model):
         if not item.get_active():
@@ -3339,7 +3480,7 @@ class ClearVoiceTray:
         self.config["noise_cancellation"]["model"] = model
         save_config(self.config)
         if self.pipeline.running:
-            self._async_restart()
+            self._async_restart(filter_only=True)
 
     def _on_nc_advanced(self, _item):
         """Dialog for the lesser-used DeepFilterNet controls."""
@@ -3397,7 +3538,7 @@ class ClearVoiceTray:
                 nc[key] = spin.get_value()
             save_config(self.config)
             if self.pipeline.running:
-                self._async_restart()
+                self._async_restart(filter_only=True)
         dialog.destroy()
 
     def _on_bf(self, item):
@@ -3514,8 +3655,10 @@ class ClearVoiceTray:
 
     # ── Helpers ──
 
-    def _async_restart(self, route_restart: bool = False, health_restart: bool = False):
-        """Restart the pipeline off the GTK thread."""
+    def _async_restart(
+        self, route_restart: bool = False, health_restart: bool = False, filter_only: bool = False
+    ):
+        """Restart the pipeline (or only the noise filter) off the GTK thread."""
         if self._quitting or not self.config.get("enabled", True):
             return
         if route_restart:
@@ -3532,7 +3675,11 @@ class ClearVoiceTray:
             try:
                 if self._quitting or not self.config.get("enabled", True):
                     return
-                ok, msg = self.pipeline.restart()
+                ok, msg = (
+                    self.pipeline.restart_filter_chain()
+                    if filter_only
+                    else self.pipeline.restart()
+                )
                 if self._quitting:
                     return
                 if not self.config.get("enabled", True):
@@ -3559,6 +3706,18 @@ class ClearVoiceTray:
         if not ok:
             self._show_error(msg)
             self._mi_enable.set_active(False)
+        return False
+
+    def _on_route_event(self):
+        """A sink, jack route or device profile changed: probe soon, coalescing bursts."""
+        if not self._quitting and not self._route_event_pending:
+            self._route_event_pending = True
+            GLib.timeout_add(ROUTE_EVENT_DEBOUNCE_MS, self._on_route_event_timeout)
+        return False
+
+    def _on_route_event_timeout(self):
+        self._route_event_pending = False
+        self._on_route_tick()
         return False
 
     def _on_route_tick(self):

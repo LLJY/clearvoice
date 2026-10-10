@@ -23,6 +23,7 @@ def _bare_tray(manager):
     tray._pw_monitor = None
     tray._route_probe_pending = False
     tray._route_restart_pending = False
+    tray._route_event_pending = False
     tray._health_restart_pending = False
     tray._quitting = False
     tray._enable_converge_lock = threading.Lock()
@@ -609,7 +610,7 @@ def test_active_mic_intent_is_reconciled_after_start_and_restart():
         manager._running = True
         return True, "started"
 
-    def stop_pipeline():
+    def stop_pipeline(restore_defaults=True):
         manager._generation += 1
         manager._running = False
         return True, "stopped"
@@ -632,7 +633,7 @@ def test_active_mic_intent_is_reconciled_after_start_and_restart():
         with (
             patch.object(manager, "_stop_locked", side_effect=stop_pipeline),
             patch.object(manager, "_start_locked", side_effect=start_pipeline),
-            patch.object(clearvoice.time, "sleep"),
+            patch.object(clearvoice, "pw_wait_for_nodes_gone", return_value=True),
         ):
             assert manager.restart()[0]
             manager._reconcile_thread.join(2)
@@ -2043,7 +2044,7 @@ def test_noise_model_menu_saves_preference_and_restarts_running_pipeline():
         tray._on_noise_model(item, "dfn3-ll")
     assert manager.config["noise_cancellation"]["model"] == "dfn3-ll"
     save.assert_called_once_with(manager.config)
-    tray._async_restart.assert_called_once_with()
+    tray._async_restart.assert_called_once_with(filter_only=True)
 
     manager._plugin_fallback = True
     manager._fc_model = "stock"
@@ -2052,6 +2053,230 @@ def test_noise_model_menu_saves_preference_and_restarts_running_pipeline():
     status = tray._mi_status.set_label.call_args.args[0]
     assert "Stock DeepFilterNet (fallback)" in status
 
+
+def test_wait_for_nodes_gone_returns_as_soon_as_pw_dump_matches_nothing():
+    present = Mock(returncode=0, stdout=json.dumps([_node("clearvoice_speakers")]))
+    gone = Mock(returncode=0, stdout="")  # pw-dump prints nothing when no object matches
+    with (
+        patch.object(clearvoice.subprocess, "run", side_effect=[present, gone]) as run,
+        patch.object(clearvoice.time, "sleep"),
+    ):
+        assert clearvoice.pw_wait_for_nodes_gone("clearvoice_", timeout=5)
+    assert run.call_count == 2
+    assert run.call_args.args[0] == ["pw-dump", "clearvoice_*"]
+
+    with (
+        patch.object(clearvoice.subprocess, "run", return_value=present),
+        patch.object(clearvoice.time, "monotonic", side_effect=[0, 0, 2]),
+        patch.object(clearvoice.time, "sleep"),
+    ):
+        assert not clearvoice.pw_wait_for_nodes_gone("clearvoice_", timeout=1)
+
+
+def test_restart_restores_defaults_unless_the_new_graph_recreates_the_virtual_mic():
+    def run(config, start_result):
+        manager = clearvoice.PipelineManager(config)
+        events = []
+
+        def start():
+            events.append("start")
+            manager._running = start_result[0]
+            return start_result
+
+        with (
+            patch.object(manager, "_kill_all", side_effect=lambda: events.append("kill")),
+            patch.object(
+                manager, "_restore_previous_defaults", side_effect=lambda: events.append("restore")
+            ),
+            patch.object(
+                clearvoice, "pw_wait_for_nodes_gone", side_effect=lambda *a, **k: events.append("gone")
+            ),
+            patch.object(manager, "_start_locked", side_effect=start),
+            patch.object(manager, "_request_mic_reconcile"),
+            patch.object(clearvoice, "wp_set_setting", return_value=True),
+        ):
+            manager._running = True
+            assert manager.restart() == start_result
+            if start_result[0]:
+                assert manager.stop()[0]
+        return events
+
+    # Virtual mic comes back: keep it as the default; a real stop still restores.
+    assert run(_config(), (True, "ok")) == ["kill", "gone", "start", "kill", "restore"]
+    # Early start exit (no _fail_start): defaults restored.
+    assert run(_config(), (False, "No audio source device found")) == [
+        "kill", "gone", "start", "restore",
+    ]
+
+
+def test_restart_into_speaker_only_graph_restores_mic_default_even_if_nc_turns_off_mid_restart():
+    config = _config()
+    config["speaker_enhancement"]["enabled"] = True
+    config["previous_default_source"] = "alsa_input.mic"
+    manager = clearvoice.PipelineManager(config)
+    manager._running = True
+    manager._started_once = True
+    sources = []
+
+    def nodes_gone(*_args, **_kwargs):
+        config["noise_cancellation"]["enabled"] = False  # user toggles NC during the wait
+        return True
+
+    with (
+        patch.object(manager, "_kill_all"),
+        patch.object(clearvoice, "pw_wait_for_nodes_gone", side_effect=nodes_gone),
+        patch.object(clearvoice, "pactl_list_sinks", return_value=[]),
+        patch.object(clearvoice, "pw_get_default_sink", return_value="alsa_output.speakers"),
+        patch.object(clearvoice, "pw_get_sink_active_port", return_value="analog-output-speaker"),
+        patch.object(manager, "_start_playback_output"),
+        patch.object(clearvoice, "wp_set_setting", return_value=True),
+        patch.object(clearvoice, "save_config"),
+        patch.object(
+            clearvoice, "pw_set_default_source", side_effect=lambda name: sources.append(name) or True
+        ),
+        patch.object(manager, "_request_mic_reconcile"),
+    ):
+        assert manager.restart()[0]
+
+    assert manager.running and not manager.nc_enabled
+    assert sources == ["alsa_input.mic"]
+
+
+def _running_filter_manager(beamforming: bool):
+    config = _config()
+    config["beamforming"]["enabled"] = beamforming
+    manager = clearvoice.PipelineManager(config)
+    manager._running = True
+    manager._base_mic_node = "mic"
+    manager._fc_proc = Mock(pid=11, poll=Mock(return_value=None))
+    manager._ec_proc = Mock(pid=12, poll=Mock(return_value=None)) if beamforming else None
+    manager._spk_proc = Mock(pid=13, poll=Mock(return_value=None))
+    return manager
+
+
+def test_filter_only_restart_relaunches_noise_filter_and_keeps_other_stages():
+    for beamforming, expected_target in ((True, clearvoice.EC_SOURCE_NAME), (False, "mic")):
+        manager = _running_filter_manager(beamforming)
+        old_fc, ec, spk = manager._fc_proc, manager._ec_proc, manager._spk_proc
+        targets = []
+
+        def start_filter(target, _plugin, manager=manager):
+            targets.append(target)
+            manager._fc_proc = Mock(pid=21, poll=Mock(return_value=None))
+            return True, ""
+
+        with (
+            patch.object(clearvoice, "pw_wait_for_nodes_gone", return_value=True),
+            patch.object(clearvoice, "find_ladspa_plugin", return_value="/tmp/df.so"),
+            patch.object(manager, "_start_filter_chain", side_effect=start_filter),
+            patch.object(manager, "set_output_gain", return_value=True),
+            patch.object(clearvoice, "pw_set_default_source", return_value=True),
+            patch.object(manager, "_request_mic_reconcile") as reconcile,
+        ):
+            assert manager.restart_filter_chain()[0], beamforming
+
+        old_fc.terminate.assert_called_once()
+        spk.terminate.assert_not_called()
+        if ec:
+            ec.terminate.assert_not_called()
+        assert targets == [expected_target]
+        assert manager.running and not manager.transitioning
+        reconcile.assert_called_once_with()
+
+
+def test_filter_only_restart_fails_open_or_falls_back_to_full_restart():
+    manager = _running_filter_manager(beamforming=True)
+    ec, spk = manager._ec_proc, manager._spk_proc
+    with (
+        patch.object(clearvoice, "pw_wait_for_nodes_gone", return_value=True),
+        patch.object(clearvoice, "find_ladspa_plugin", return_value="/tmp/df.so"),
+        patch.object(manager, "_start_filter_chain", return_value=(False, "boom")),
+        patch.object(manager, "_restore_previous_defaults") as restore,
+        patch.object(clearvoice, "wp_set_setting", return_value=True),
+    ):
+        assert manager.restart_filter_chain() == (False, "boom")
+    ec.terminate.assert_called_once()
+    spk.terminate.assert_called_once()
+    restore.assert_called_once_with()
+    assert not manager.running
+
+    manager = _running_filter_manager(beamforming=False)
+    spk = manager._spk_proc
+    with (
+        patch.object(clearvoice, "pw_wait_for_nodes_gone", return_value=True),
+        patch.object(clearvoice, "find_ladspa_plugin", return_value="/tmp/df.so"),
+        patch.object(manager, "_start_filter_chain", return_value=(True, "")),
+        patch.object(manager, "set_output_gain", return_value=False),
+        patch.object(clearvoice, "pw_set_default_source", return_value=True),
+        patch.object(manager, "_restore_previous_defaults"),
+        patch.object(clearvoice, "wp_set_setting", return_value=True),
+    ):
+        assert not manager.restart_filter_chain()[0]  # lock_base_mic_audio defaults on
+    spk.terminate.assert_called_once()
+    assert not manager.running
+
+    manager = _running_filter_manager(beamforming=False)
+    manager._fc_proc = None  # noise filter not part of the running graph
+    with patch.object(manager, "restart", return_value=(True, "restarted")) as restart:
+        assert manager.restart_filter_chain() == (True, "restarted")
+    restart.assert_called_once_with()
+
+
+def _alsa_device(route, volume=0.5):
+    return {
+        "id": 54,
+        "type": "PipeWire:Interface:Device",
+        "info": {
+            "props": {"device.name": "alsa_card.x", "device.api": "alsa"},
+            "params": {
+                "Route": [{"name": route, "available": "yes", "props": {"volume": volume}}],
+                "EnumProfile": [{"name": "output:analog-stereo", "available": "yes"}],
+            },
+        },
+    }
+
+
+def _sink(name, node_id):
+    return {
+        "id": node_id,
+        "type": "PipeWire:Interface:Node",
+        "info": {"props": {"node.name": name, "media.class": "Audio/Sink"}},
+    }
+
+
+def test_monitor_signals_route_changes_but_not_volume_or_clearvoice_nodes():
+    on_route = Mock()
+    monitor = clearvoice.PipeWireMonitor(Mock(), on_route_change=on_route)
+
+    def diff(objects):
+        monitor._check_diff(json.dumps(objects).encode())
+        fired = on_route.call_count
+        on_route.reset_mock()
+        return fired
+
+    with patch.object(clearvoice.GLib, "idle_add", side_effect=lambda fn, *args: fn(*args)):
+        assert diff([_alsa_device("analog-output-speaker"), _sink("alsa_output.x", 60)]) == 0
+        assert diff([_alsa_device("analog-output-speaker", volume=0.9)]) == 0
+        assert diff([_sink(clearvoice.SPEAKER_SINK_NAME, 61)]) == 0
+        assert diff([_alsa_device("analog-output-headphones")]) == 1
+        assert diff([_sink("bluez_output.40_B3_FA_86_16_ED.1", 62)]) == 1
+        assert diff([{"id": 62, "type": None, "info": None}]) == 1
+        assert diff([{"id": 61, "type": None, "info": None}]) == 0
+
+
+def test_route_events_coalesce_into_one_probe():
+    tray = _bare_tray(clearvoice.PipelineManager(_config()))
+    tray._on_route_tick = Mock(return_value=True)
+    with patch.object(clearvoice.GLib, "timeout_add") as timeout_add:
+        for _ in range(3):
+            tray._on_route_event()
+        timeout_add.assert_called_once()
+        delay, callback = timeout_add.call_args.args
+        assert delay == clearvoice.ROUTE_EVENT_DEBOUNCE_MS
+        assert callback() is False
+        tray._on_route_tick.assert_called_once_with()
+        tray._on_route_event()
+        assert timeout_add.call_count == 2
 
 def _launch_running_filter_chain(manager, runtime: Path, model: str):
     """Run the real launcher with only the child process and node wait mocked."""
