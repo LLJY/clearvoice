@@ -1167,22 +1167,130 @@ def test_active_port_detection_handles_missing_and_malformed_data():
         assert clearvoice.pw_get_sink_active_port("physical") is None
 
 
-def test_headphone_mode_disables_effective_features_without_changing_preferences():
+def test_headphones_or_bluetooth_headset_run_only_noise_cancellation():
+    for route in ("headphones", "bluetooth headset"):
+        config = _config()
+        config["beamforming"]["enabled"] = True
+        config["echo_cancellation"]["enabled"] = True
+        config["speaker_enhancement"]["enabled"] = True
+        manager = clearvoice.PipelineManager(config)
+        if route == "headphones":
+            manager._headphone_mode = True
+        else:
+            manager._bluetooth_headset = "bluez_output.AC_80_0A_7B_40_E3.1"
+
+        assert not manager.bf_enabled, route
+        assert not manager.aec_enabled, route
+        assert not manager.spk_enabled, route
+        assert manager.nc_enabled
+        assert manager.studio_enabled
+        assert config["beamforming"]["enabled"]
+        assert config["echo_cancellation"]["enabled"]
+        assert config["speaker_enhancement"]["enabled"]
+
+
+def _bt_device(address, form_factor, has_mic):
+    """A Bluetooth sink and its card as `pactl --format=json` reports them."""
+    card_name = f"bluez_card.{address}"
+    sink = {
+        "name": f"bluez_output.{address}.1",
+        "properties": {
+            "device.api": "bluez5",
+            "device.name": card_name,
+            "device.form_factor": form_factor,
+        },
+    }
+    profiles = {
+        "off": {"sinks": 0, "sources": 0, "available": True},
+        "a2dp-sink": {"sinks": 1, "sources": 0, "available": True},
+    }
+    if has_mic:
+        profiles["headset-head-unit"] = {"sinks": 1, "sources": 1, "available": True}
+    return sink, {"name": card_name, "profiles": profiles}
+
+
+def test_bluetooth_headset_detection_requires_a_mic_and_a_worn_form_factor():
+    analog = {"name": "alsa_output.physical", "properties": {"device.api": "alsa", "device.name": "alsa_card.x"}}
+    analog_card = {"name": "alsa_card.x", "profiles": {"duplex": {"sinks": 1, "sources": 1, "available": True}}}
+    airpods, airpods_card = _bt_device("40_B3_FA_86_16_ED", "headphone", has_mic=True)
+    sony, sony_card = _bt_device("AC_80_0A_7B_40_E3", "headset", has_mic=True)
+    jbl, jbl_card = _bt_device("D8_37_3B_3C_C4_D9", "headphone", has_mic=False)
+    boombox, boombox_card = _bt_device("11_22_33_44_55_66", "portable", has_mic=True)
+    manager = clearvoice.PipelineManager(_config())
+
+    def detect(sinks, cards):
+        with (
+            patch.object(clearvoice, "pactl_list_sinks", return_value=sinks),
+            patch.object(clearvoice, "pactl_list_cards", return_value=cards),
+        ):
+            return manager.detect_bluetooth_headset()
+
+    assert detect([analog], [analog_card]) is None
+    assert detect([analog, jbl, boombox], [analog_card, jbl_card, boombox_card]) is None
+    devices = [analog, airpods, sony, jbl]
+    cards = [analog_card, airpods_card, sony_card, jbl_card]
+    assert detect(devices, cards) == airpods["name"]
+    manager._bluetooth_headset = sony["name"]
+    assert detect(devices, cards) == sony["name"]
+    assert detect(None, cards) == sony["name"]
+    assert detect(devices, None) == sony["name"]
+    sony_card["profiles"]["headset-head-unit"]["available"] = False
+    assert detect(devices, cards) == airpods["name"]
+    assert detect([analog], [analog_card]) is None
+
+
+def test_route_change_gives_bluetooth_headset_precedence_over_headphone_jack():
+    manager = clearvoice.PipelineManager(_config())
+    bt = "bluez_output.40_B3_FA_86_16_ED.1"
+
+    assert manager.route_changed(False, bt)
+    assert not manager.route_changed(None, None)
+    assert not manager.route_changed(False, None)
+    assert manager.route_changed(True, None)
+
+    manager._bluetooth_headset = bt
+    assert not manager.route_changed(True, bt)
+    assert not manager.route_changed(None, bt)
+    assert manager.route_changed(False, None)
+    assert manager.route_changed(False, "bluez_output.AC_80_0A_7B_40_E3.1")
+
+
+def test_bluetooth_headset_selects_sink_without_volume_or_speaker_chain():
     config = _config()
-    config["beamforming"]["enabled"] = True
-    config["echo_cancellation"]["enabled"] = True
     config["speaker_enhancement"]["enabled"] = True
     manager = clearvoice.PipelineManager(config)
-    manager._headphone_mode = True
+    manager._physical_sink = "alsa_output.physical"
+    manager._bluetooth_headset = "bluez_output.40_B3_FA_86_16_ED.1"
 
-    assert not manager.bf_enabled
-    assert not manager.aec_enabled
-    assert not manager.spk_enabled
-    assert manager.nc_enabled
-    assert manager.studio_enabled
-    assert config["beamforming"]["enabled"]
-    assert config["echo_cancellation"]["enabled"]
-    assert config["speaker_enhancement"]["enabled"]
+    with (
+        patch.object(clearvoice, "pw_set_node_volume") as set_volume,
+        patch.object(clearvoice, "pw_find_node_id", return_value=77),
+        patch.object(clearvoice, "pw_set_default_sink", return_value=True) as set_default,
+        patch.object(clearvoice, "pw_move_playback_streams") as move,
+        patch.object(clearvoice.subprocess, "Popen") as popen,
+    ):
+        manager._start_playback_output()
+
+    assert manager._playback_sink == manager._bluetooth_headset
+    set_volume.assert_not_called()
+    popen.assert_not_called()
+    set_default.assert_called_once_with(77)
+    move.assert_called_once_with("alsa_output.physical", manager._bluetooth_headset)
+
+
+def test_stop_keeps_connected_bluetooth_headset_as_default_sink():
+    config = _config()
+    config["previous_default_sink"] = "alsa_output.physical"
+    for headset, restored in ((None, True), ("bluez_output.40_B3_FA_86_16_ED.1", False)):
+        manager = clearvoice.PipelineManager(config)
+        with (
+            patch.object(clearvoice, "pw_set_default_source", return_value=True),
+            patch.object(manager, "detect_bluetooth_headset", return_value=headset),
+            patch.object(clearvoice, "pw_find_node_id", return_value=8),
+            patch.object(clearvoice, "pw_set_default_sink", return_value=True) as set_default,
+        ):
+            manager._restore_previous_defaults()
+        assert set_default.called == restored, headset
 
 
 def test_output_route_uses_headphone_or_speaker_gain():

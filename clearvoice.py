@@ -488,28 +488,36 @@ def pw_get_default_sink() -> str:
         return ""
 
 
-def pactl_list_sinks() -> list[dict] | None:
-    """Return PulseAudio-compatible sink data, or None on query errors."""
+def _pactl_list(kind: str) -> list[dict] | None:
+    """Return PulseAudio-compatible *kind* (sinks, cards) data, or None on query errors."""
     try:
         result = subprocess.run(
-            ["pactl", "--format=json", "list", "sinks"],
+            ["pactl", "--format=json", "list", kind],
             capture_output=True,
             text=True,
             timeout=3,
         )
         if result.returncode != 0:
-            log.warning("Could not list sinks: %s", result.stderr.strip())
+            log.warning("Could not list %s: %s", kind, result.stderr.strip())
             return None
-        sinks = json.loads(result.stdout)
-        if not isinstance(sinks, list) or not all(
-            isinstance(sink, dict) for sink in sinks
+        entries = json.loads(result.stdout)
+        if not isinstance(entries, list) or not all(
+            isinstance(entry, dict) for entry in entries
         ):
-            log.warning("Unexpected sink list response")
+            log.warning("Unexpected %s list response", kind)
             return None
-        return sinks
+        return entries
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
-        log.warning("Could not list sinks: %s", exc)
+        log.warning("Could not list %s: %s", kind, exc)
         return None
+
+
+def pactl_list_sinks() -> list[dict] | None:
+    return _pactl_list("sinks")
+
+
+def pactl_list_cards() -> list[dict] | None:
+    return _pactl_list("cards")
 
 
 def pw_get_sink_active_port(sink_name: str) -> str | None:
@@ -522,6 +530,32 @@ def pw_get_sink_active_port(sink_name: str) -> str | None:
             active_port = sink.get("active_port")
             return active_port if isinstance(active_port, str) else None
     return None
+
+
+# Class-of-device form factors that play into the room even when they have a mic.
+BLUETOOTH_LOUDSPEAKER_FORM_FACTORS = {"speaker", "portable", "hifi", "car"}
+
+
+def _bluetooth_output_card(sink: dict) -> str | None:
+    """Card name of a Bluetooth output that is not a loudspeaker, else None."""
+    properties = sink.get("properties")
+    if not isinstance(properties, dict) or properties.get("device.api") != "bluez5":
+        return None
+    if properties.get("device.form_factor") in BLUETOOTH_LOUDSPEAKER_FORM_FACTORS:
+        return None
+    card = properties.get("device.name")
+    return card if isinstance(card, str) else None
+
+
+def _card_has_mic(card: dict) -> bool:
+    """A mic shows up as an available card profile with an input (HSP/HFP head unit)."""
+    profiles = card.get("profiles")
+    return isinstance(profiles, dict) and any(
+        isinstance(profile, dict)
+        and profile.get("sources", 0) > 0
+        and profile.get("available", True)
+        for profile in profiles.values()
+    )
 
 
 def pw_move_playback_streams(physical_sink: str, new_sink: str) -> bool:
@@ -1503,6 +1537,7 @@ class PipelineManager:
         self._physical_sink: str | None = None
         self._playback_sink: str | None = None
         self._headphone_mode = False
+        self._bluetooth_headset: str | None = None
         self._route_confirmed = False
         self._mic_demand = False
         self._demand_revision = 0
@@ -1539,16 +1574,25 @@ class PipelineManager:
         return self._headphone_mode
 
     @property
+    def bluetooth_headset(self) -> str | None:
+        return self._bluetooth_headset
+
+    @property
+    def _speakers_bypassed(self) -> bool:
+        """Headphones or a Bluetooth headset: no speaker echo, so only NC runs."""
+        return self._headphone_mode or self._bluetooth_headset is not None
+
+    @property
     def nc_enabled(self) -> bool:
         return self.config["noise_cancellation"]["enabled"]
 
     @property
     def bf_enabled(self) -> bool:
-        return self.config["beamforming"]["enabled"] and not self._headphone_mode
+        return self.config["beamforming"]["enabled"] and not self._speakers_bypassed
 
     @property
     def aec_enabled(self) -> bool:
-        return self.config["echo_cancellation"]["enabled"] and not self._headphone_mode
+        return self.config["echo_cancellation"]["enabled"] and not self._speakers_bypassed
 
     @property
     def ec_needed(self) -> bool:
@@ -1558,7 +1602,7 @@ class PipelineManager:
     def spk_enabled(self) -> bool:
         return (
             self.config.get("speaker_enhancement", {}).get("enabled", False)
-            and not self._headphone_mode
+            and not self._speakers_bypassed
         )
 
     @property
@@ -1668,6 +1712,41 @@ class PipelineManager:
         self._headphone_mode = mode
         self._route_confirmed = True
 
+    def detect_bluetooth_headset(self) -> str | None:
+        """Return the sink of a connected Bluetooth headset (output with a mic).
+
+        Mic-less Bluetooth outputs and loudspeakers are ignored. Keeps the current
+        headset if PipeWire cannot be queried.
+        """
+        sinks = pactl_list_sinks()
+        if sinks is None:
+            return self._bluetooth_headset
+        outputs = [
+            (sink.get("name"), card)
+            for sink in sinks
+            if isinstance(sink.get("name"), str) and (card := _bluetooth_output_card(sink))
+        ]
+        if not outputs:
+            return None
+        cards = pactl_list_cards()
+        if cards is None:
+            return self._bluetooth_headset
+        with_mic = {c.get("name") for c in cards if _card_has_mic(c)}
+        names = [name for name, card in outputs if card in with_mic]
+        if self._bluetooth_headset in names:
+            return self._bluetooth_headset
+        return names[0] if names else None
+
+    def route_changed(self, headphone_mode: bool | None, bluetooth_headset: str | None) -> bool:
+        """Whether a probed route needs a restart; a Bluetooth headset takes precedence."""
+        if bluetooth_headset != self._bluetooth_headset:
+            return True
+        return (
+            bluetooth_headset is None
+            and headphone_mode is not None
+            and headphone_mode != self._headphone_mode
+        )
+
     # ── Gain / Policy Management ──
 
     @staticmethod
@@ -1734,9 +1813,9 @@ class PipelineManager:
             return pw_set_node_volume(SPEAKER_SINK_NAME, speaker_percent)
         return pw_set_node_volume(physical_sink, speaker_percent)
 
-    def _set_playback_sink(self, sink_name: str, gain_percent: int) -> bool:
-        """Set the sink volume and default, then move non-ClearVoice streams."""
-        gain_set = pw_set_node_volume(sink_name, gain_percent)
+    def _set_playback_sink(self, sink_name: str, gain_percent: int | None) -> bool:
+        """Set the sink volume (unless None) and default, then move non-ClearVoice streams."""
+        gain_set = gain_percent is None or pw_set_node_volume(sink_name, gain_percent)
         sink_id = pw_find_node_id(sink_name)
         if sink_id is None:
             log.warning("Could not find playback sink %s", sink_name)
@@ -1779,8 +1858,16 @@ class PipelineManager:
             log.warning("Could not stop failed speaker-chain process (pid %s): %s", pid, exc)
 
     def _start_playback_output(self):
-        """Activate the appropriate speaker or headphone playback route."""
+        """Activate the Bluetooth headset, headphone or speaker playback route."""
         self._playback_sink = None
+        if self._bluetooth_headset:
+            # Bluetooth volume is the device's own; only select the sink.
+            self._set_playback_sink(self._bluetooth_headset, None)
+            if self._playback_sink == self._bluetooth_headset:
+                log.info("Bluetooth headset %s: only noise cancellation runs", self._bluetooth_headset)
+            else:
+                log.warning("Could not select Bluetooth headset sink %s", self._bluetooth_headset)
+            return
         physical_sink = self._physical_sink
         if not physical_sink:
             log.warning("No physical playback sink found; leaving playback route unchanged")
@@ -2298,6 +2385,7 @@ class PipelineManager:
         self._playback_sink = None
         self._physical_sink = self._resolve_physical_sink()
         self._refresh_headphone_mode()
+        self._bluetooth_headset = self.detect_bluetooth_headset()
 
         # Fail open even if an earlier start attempt did not reach the final stage.
         self._publish_lock_state(False)
@@ -2357,11 +2445,12 @@ class PipelineManager:
                 )
 
         log.info(
-            "Starting pipeline — source=%s mic=%s spk=%s hp=%s",
+            "Starting pipeline — source=%s mic=%s spk=%s hp=%s bt=%s",
             source,
             needs_mic,
             self.spk_enabled,
             self._headphone_mode,
+            self._bluetooth_headset,
         )
 
         # Remember current defaults so we can restore them
@@ -2538,7 +2627,8 @@ class PipelineManager:
             pw_set_default_source(prev)
 
         prev_sink = self.config.get("previous_default_sink")
-        if prev_sink:
+        # Keep a connected Bluetooth headset selected instead of moving playback to the speakers.
+        if prev_sink and not self.detect_bluetooth_headset():
             # Restore by name — find its node ID
             sink_id = pw_find_node_id(prev_sink)
             if sink_id:
@@ -3485,24 +3575,26 @@ class ClearVoiceTray:
 
         def _probe():
             try:
-                mode = self.pipeline.detect_headphone_mode()
+                route = (
+                    self.pipeline.detect_headphone_mode(),
+                    self.pipeline.detect_bluetooth_headset(),
+                )
             except Exception as exc:
                 log.warning("Could not probe output route: %s", exc)
-                mode = None
-            GLib.idle_add(self._on_route_probe_complete, mode)
+                route = (None, self.pipeline.bluetooth_headset)
+            GLib.idle_add(self._on_route_probe_complete, *route)
 
         threading.Thread(target=_probe, daemon=True).start()
         return True
 
-    def _on_route_probe_complete(self, mode: bool | None):
+    def _on_route_probe_complete(self, mode: bool | None, bluetooth_headset: str | None):
         self._route_probe_pending = False
         if (
-            mode is not None
-            and not self._quitting
+            not self._quitting
             and self.config.get("enabled", True)
             and self.pipeline.running
             and not self.pipeline.transitioning
-            and mode != self.pipeline.headphone_mode
+            and self.pipeline.route_changed(mode, bluetooth_headset)
         ):
             self._async_restart(route_restart=True)
         return False
@@ -3535,8 +3627,10 @@ class ClearVoiceTray:
                 parts.append("AEC")
             if self.pipeline.spk_enabled:
                 parts.append("SPK")
-            if self.pipeline.headphone_mode:
+            if self.pipeline.headphone_mode and not self.pipeline.bluetooth_headset:
                 parts.append("HP")
+            if self.pipeline.bluetooth_headset:
+                parts.append("BT")
             tag = "+".join(parts) or "enabled"
             state = "Processing" if nodes_active else "Standby"
             self._mi_status.set_label(f"{state} [{tag}]")
