@@ -140,6 +140,10 @@ else
     echo "Installed ClearVoice LADSPA plugin: $DEST"
 fi
 
+# The revision marker describes a ~/.local dev install; packages are versioned by pacman.
+if [[ -n "${CLEARVOICE_PLUGIN_DIR:-}" ]]; then
+    exit 0
+fi
 revision="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
 if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain -- plugin)" ]]; then
     dirty=true

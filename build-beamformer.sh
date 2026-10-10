@@ -3,10 +3,11 @@ set -euo pipefail
 
 PIPEWIRE_VERSION=1.6.9
 PIPEWIRE_COMMIT=8fa27cabdc6c0c1350c69c026af5850ef0af1e26
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/clearvoice/pipewire-$PIPEWIRE_VERSION-legacy"
+# Overridable so a package build stays inside its own build and staging directories.
+CACHE_DIR="${CLEARVOICE_BEAMFORMER_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/clearvoice/pipewire-$PIPEWIRE_VERSION-legacy}"
 SOURCE_DIR="$CACHE_DIR/source"
 BUILD_DIR="$CACHE_DIR/build"
-DEST_DIR="$HOME/.local/lib/clearvoice/spa-0.2/aec"
+DEST_DIR="${CLEARVOICE_SPA_DIR:-$HOME/.local/lib/clearvoice/spa-0.2}/aec"
 DEST="$DEST_DIR/libspa-aec-webrtc.so"
 
 for cmd in git meson ninja pkg-config python3 ldd readelf pipewire; do

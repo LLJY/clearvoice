@@ -54,8 +54,19 @@ RUNTIME_DIR = (
 )
 PIDFILE = RUNTIME_DIR / "clearvoice.pid"
 
-PRIVATE_SPA_ROOT = Path.home() / ".local/lib/clearvoice/spa-0.2"
-PRIVATE_AEC_PLUGIN = PRIVATE_SPA_ROOT / "aec/libspa-aec-webrtc.so"
+# Private plugins: a user build (build-*.sh) overrides the system package.
+USER_LIB_DIR = Path.home() / ".local/lib/clearvoice"
+SYSTEM_LIB_DIR = Path("/usr/lib/clearvoice")
+
+
+def _lib_path(relative: str) -> Path:
+    """Return the user-built file if present, else the system-packaged one."""
+    user = USER_LIB_DIR / relative
+    return user if user.is_file() else SYSTEM_LIB_DIR / relative
+
+
+PRIVATE_AEC_PLUGIN = _lib_path("spa-0.2/aec/libspa-aec-webrtc.so")
+PRIVATE_SPA_ROOT = PRIVATE_AEC_PLUGIN.parents[1]
 SYSTEM_SPA_ROOT = Path("/usr/lib/spa-0.2")
 REQUIRED_PIPEWIRE_SERIES = "1.6"
 DEEPFILTER_RT_PRIORITY = 10
@@ -70,9 +81,7 @@ EC_SOURCE_DESC = "ClearVoice Beamformed"
 DEEPFILTER_SO = "libdeep_filter_ladspa.so"
 DEEPFILTER_LABEL_MONO = "deep_filter_mono"
 DEEPFILTER_LABEL_STEREO = "deep_filter_stereo"
-CLEARVOICE_LADSPA_PLUGIN = (
-    Path.home() / ".local/lib/clearvoice/ladspa/libclearvoice_ladspa.so"
-)
+CLEARVOICE_LADSPA_PLUGIN = _lib_path("ladspa/libclearvoice_ladspa.so")
 NOISE_MODELS = {
     "stock": "Stock DeepFilterNet",
     "dfn3-ll": "DeepFilterNet3-LL (constant latency)",
@@ -1472,6 +1481,20 @@ def _pw_conf_filter_chain(
     )
 
 
+def _speaker_chain_conf(physical_sink: str) -> str:
+    """The shipped speaker-chain template, playing into this machine's physical sink."""
+    template = SPEAKER_CHAIN_CONF.read_text()
+    conf, count = re.subn(
+        r'^(\s*target\.object\s*=\s*)"[^"]*"',
+        lambda match: f'{match.group(1)}"{physical_sink}"',
+        template,
+        flags=re.MULTILINE,
+    )
+    if count != 1:
+        raise OSError(f"{SPEAKER_CHAIN_CONF}: expected one target.object, found {count}")
+    return conf
+
+
 def _pw_conf_echo_cancel(
     target_source: str | None = None,
     monitor_mode: bool = False,
@@ -1967,13 +1990,15 @@ class PipelineManager:
         pw_set_node_volume(physical_sink, 100)
         log.info("Spawning speaker-chain process")
         try:
+            conf_path = RUNTIME_DIR / "speaker-chain.conf"
+            conf_path.write_text(_speaker_chain_conf(physical_sink))
             with open(RUNTIME_DIR / "speaker-chain.log", "a") as spk_log:
                 spk_log.write(
                     f"\n--- speaker-chain start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
                 )
                 spk_log.flush()
                 self._spk_proc = self._spawn_child(
-                    ["pipewire", "-c", str(SPEAKER_CHAIN_CONF)],
+                    ["pipewire", "-c", str(conf_path)],
                     stdout=subprocess.DEVNULL,
                     stderr=spk_log,
                 )

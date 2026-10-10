@@ -964,6 +964,21 @@ def test_echo_child_environment_ignores_parent_spa_path():
     assert bf_env["PIPEWIRE_MODULE_DIR"] == "/modules"
 
 
+def test_private_plugins_prefer_a_user_build_over_the_system_package():
+    relative = "spa-0.2/aec/libspa-aec-webrtc.so"
+    with tempfile.TemporaryDirectory() as user, tempfile.TemporaryDirectory() as system:
+        with (
+            patch.object(clearvoice, "USER_LIB_DIR", Path(user)),
+            patch.object(clearvoice, "SYSTEM_LIB_DIR", Path(system)),
+        ):
+            assert clearvoice._lib_path(relative) == Path(system, relative)
+            Path(user, relative).parent.mkdir(parents=True)
+            Path(user, relative).write_bytes(b"")
+            assert clearvoice._lib_path(relative) == Path(user, relative)
+    # The beamformer SPA root is the directory that holds aec/.
+    assert clearvoice.PRIVATE_SPA_ROOT == clearvoice.PRIVATE_AEC_PLUGIN.parents[1]
+
+
 def test_beamformer_source_preflight_requires_manager_visible_fl_fr_ports():
     objects = [_node("mic"), _output_port(1, "FL"), _output_port(1, "FR")]
     with patch.object(clearvoice, "pw_dump_objects", return_value=objects) as dump:
@@ -1521,10 +1536,6 @@ def test_aec_reference_uses_physical_sink_when_speaker_chain_falls_back():
         Path(runtime, "speaker-chain.log").write_text("prior crash output\n")
         with (
             patch.object(clearvoice, "RUNTIME_DIR", Path(runtime)),
-            patch.object(
-                clearvoice, "SPEAKER_CHAIN_CONF", Path(runtime, "speaker.conf")
-            ),
-            patch.object(Path, "is_file", return_value=True),
             patch.object(clearvoice.subprocess, "Popen", return_value=Mock()) as popen,
             patch.object(clearvoice, "pw_set_node_volume", return_value=True),
             patch.object(clearvoice, "pw_find_node_id", return_value=8),
@@ -1538,6 +1549,11 @@ def test_aec_reference_uses_physical_sink_when_speaker_chain_falls_back():
         assert popen.call_args.kwargs["stderr"].closed
         assert "prior crash output" in Path(runtime, "speaker-chain.log").read_text()
         assert "speaker-chain start" in Path(runtime, "speaker-chain.log").read_text()
+        # The machine-specific playback target is filled in at runtime, not shipped.
+        conf = Path(runtime, "speaker-chain.conf")
+        assert popen.call_args.args[0] == ["pipewire", "-c", str(conf)]
+        assert 'target.object = "alsa_output.physical"' in conf.read_text()
+        assert "Equalizer8Band" in conf.read_text()
 
     assert manager._playback_sink == "alsa_output.physical"
     set_default.assert_called_once_with(8)
@@ -1556,10 +1572,6 @@ def test_speaker_default_failure_falls_back_to_physical_and_stops_child():
     with tempfile.TemporaryDirectory() as runtime:
         with (
             patch.object(clearvoice, "RUNTIME_DIR", Path(runtime)),
-            patch.object(
-                clearvoice, "SPEAKER_CHAIN_CONF", Path(runtime, "speaker.conf")
-            ),
-            patch.object(Path, "is_file", return_value=True),
             patch.object(clearvoice.subprocess, "Popen", return_value=speaker_proc),
             patch.object(clearvoice, "pw_set_node_volume", return_value=True),
             patch.object(clearvoice, "pw_wait_for_node", return_value=True),
@@ -1597,10 +1609,6 @@ def test_dead_failed_speaker_child_does_not_trigger_pipeline_health_restart():
     with tempfile.TemporaryDirectory() as runtime:
         with (
             patch.object(clearvoice, "RUNTIME_DIR", Path(runtime)),
-            patch.object(
-                clearvoice, "SPEAKER_CHAIN_CONF", Path(runtime, "speaker.conf")
-            ),
-            patch.object(Path, "is_file", return_value=True),
             patch.object(clearvoice.subprocess, "Popen", return_value=failed_speaker),
             patch.object(clearvoice, "pw_set_node_volume", return_value=True),
             patch.object(clearvoice, "pw_wait_for_node", return_value=False),
