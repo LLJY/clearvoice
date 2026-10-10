@@ -1,0 +1,18 @@
+post_install() {
+  cat <<'EOF'
+==> ClearVoice starts automatically at your next graphical login.
+==> Load its WirePlumber policy once, as your user (not root):
+      systemctl --user restart wireplumber pipewire-pulse
+==> Start it now from your application menu or by running: clearvoice
+==> A previous ./deploy.sh install still autostarts from ~/.config/autostart;
+    remove ~/.config/autostart/clearvoice.desktop to use the package's entry.
+EOF
+}
+
+post_upgrade() {
+  echo "==> Restart ClearVoice (quit from the tray, then run clearvoice) to use the new version."
+}
+
+post_remove() {
+  echo "==> Run 'systemctl --user restart wireplumber pipewire-pulse' to unload the ClearVoice policy."
+}

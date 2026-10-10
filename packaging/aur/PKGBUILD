@@ -1,0 +1,84 @@
+# Maintainer: Lucas Lee Jing Yi <lucasleeeeeeeee@gmail.com>
+pkgname=clearvoice-git
+_pkgname=clearvoice
+pkgver=r0
+pkgrel=1
+pkgdesc="PipeWire virtual microphone with DeepFilterNet noise cancellation, beamforming and echo cancellation (tray app)"
+arch=('x86_64')
+url="https://github.com/LLJY/clearvoice"
+license=('GPL-3.0-or-later')
+depends=(
+  'pipewire'
+  'pipewire-pulse'           # pactl
+  'wireplumber>=0.5.15'      # wpctl; the policy script needs PermissionManager (0.5.15)
+  'python'
+  'python-gobject'
+  'gtk3'
+  'libayatana-appindicator'
+  'webrtc-audio-processing-0.3'  # private legacy beamformer backend
+  'calf'                     # speaker chain LV2 plugins
+  'libdeep_filter_ladspa'    # stock DeepFilterNet LADSPA (AUR: libdeep_filter_ladspa-bin)
+  'onnxruntime'              # DFN3-LL int8 backend (/usr/lib/libonnxruntime.so.1)
+  'procps-ng'                # pgrep
+)
+makedepends=('git' 'meson' 'ninja' 'pkgconf' 'rust' 'uv' 'curl')
+checkdepends=('python-pytest')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+install=clearvoice.install
+# The DFN3-LL exporter and the PipeWire/DeepFilterNet sources are fetched at build time
+# and pinned by commit and sha256 inside the build scripts.
+options=('!lto' '!debug')
+source=("$_pkgname::git+https://github.com/LLJY/clearvoice.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_pkgname"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  cd "$_pkgname"
+  local stage="$srcdir/stage"
+  export CARGO_HOME="$srcdir/cargo-home"
+  export UV_CACHE_DIR="$srcdir/uv-cache"
+  export UV_PYTHON_INSTALL_DIR="$srcdir/uv-python"
+  # Dependencies are fetched once here; build-plugin.sh builds --locked.
+  cargo fetch --locked --manifest-path plugin/Cargo.toml
+
+  CLEARVOICE_BEAMFORMER_CACHE="$srcdir/pipewire-legacy" \
+  CLEARVOICE_SPA_DIR="$stage/usr/lib/clearvoice/spa-0.2" \
+    ./build-beamformer.sh
+
+  # makepkg exports RUSTFLAGS, which replaces plugin/.cargo/config.toml's flags.
+  RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native" \
+  CLEARVOICE_PLUGIN_DIR="$stage/usr/lib/clearvoice/ladspa" \
+    ./build-plugin.sh
+}
+
+check() {
+  cd "$_pkgname"
+  python -s -m pytest -q test_clearvoice.py
+}
+
+package() {
+  cd "$_pkgname"
+  cp -a "$srcdir/stage/." "$pkgdir/"
+
+  install -Dm755 clearvoice.py "$pkgdir/usr/share/clearvoice/clearvoice.py"
+  install -Dm644 speaker-chain.conf "$pkgdir/usr/share/clearvoice/speaker-chain.conf"
+  install -Dm755 packaging/clearvoice.sh "$pkgdir/usr/bin/clearvoice"
+
+  # WirePlumber loads fragments and scripts from $datadir for every user.
+  install -Dm644 clearvoice-wireplumber.conf \
+    "$pkgdir/usr/share/wireplumber/wireplumber.conf.d/90-clearvoice-lock.conf"
+  install -Dm644 clearvoice-lock.lua \
+    "$pkgdir/usr/share/wireplumber/scripts/90-clearvoice-lock.lua"
+
+  install -Dm644 packaging/clearvoice.desktop \
+    "$pkgdir/usr/share/applications/clearvoice.desktop"
+  # Autostart for every user's graphical session (XDG autostart).
+  install -Dm644 packaging/clearvoice.desktop "$pkgdir/etc/xdg/autostart/clearvoice.desktop"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

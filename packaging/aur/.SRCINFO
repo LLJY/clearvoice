@@ -1,0 +1,36 @@
+pkgbase = clearvoice-git
+	pkgdesc = PipeWire virtual microphone with DeepFilterNet noise cancellation, beamforming and echo cancellation (tray app)
+	pkgver = r0
+	pkgrel = 1
+	url = https://github.com/LLJY/clearvoice
+	install = clearvoice.install
+	arch = x86_64
+	license = GPL-3.0-or-later
+	checkdepends = python-pytest
+	makedepends = git
+	makedepends = meson
+	makedepends = ninja
+	makedepends = pkgconf
+	makedepends = rust
+	makedepends = uv
+	makedepends = curl
+	depends = pipewire
+	depends = pipewire-pulse
+	depends = wireplumber>=0.5.15
+	depends = python
+	depends = python-gobject
+	depends = gtk3
+	depends = libayatana-appindicator
+	depends = webrtc-audio-processing-0.3
+	depends = calf
+	depends = libdeep_filter_ladspa
+	depends = onnxruntime
+	depends = procps-ng
+	provides = clearvoice
+	conflicts = clearvoice
+	options = !lto
+	options = !debug
+	source = clearvoice::git+https://github.com/LLJY/clearvoice.git
+	sha256sums = SKIP
+
+pkgname = clearvoice-git
